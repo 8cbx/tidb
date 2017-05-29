@@ -22,8 +22,6 @@ import (
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
@@ -38,6 +36,8 @@ import (
 
 // ShowExec represents a show executor.
 type ShowExec struct {
+	baseExecutor
+
 	Tp     ast.ShowStmtType // Databases/Tables/Columns/....
 	DBName model.CIStr
 	Table  *ast.TableName  // Used for showing columns.
@@ -46,21 +46,14 @@ type ShowExec struct {
 	Full   bool
 	User   string // Used for show grants.
 
-	// Used by show variables
+	// GlobalScope is used by show variables
 	GlobalScope bool
 
-	schema *expression.Schema
-	ctx    context.Context
-	is     infoschema.InfoSchema
+	is infoschema.InfoSchema
 
 	fetched bool
 	rows    []*Row
 	cursor  int
-}
-
-// Schema implements the Executor Schema interface.
-func (e *ShowExec) Schema() *expression.Schema {
-	return e.schema
 }
 
 // Next implements Execution Next interface.
@@ -138,9 +131,13 @@ func (e *ShowExec) fetchShowEngines() error {
 
 func (e *ShowExec) fetchShowDatabases() error {
 	dbs := e.is.AllSchemaNames()
+	checker := privilege.GetPrivilegeManager(e.ctx)
 	// TODO: let information_schema be the first database
 	sort.Strings(dbs)
 	for _, d := range dbs {
+		if checker != nil && !checker.DBIsVisible(d) {
+			continue
+		}
 		e.rows = append(e.rows, &Row{Data: types.MakeDatums(d)})
 	}
 	return nil
@@ -179,9 +176,15 @@ func (e *ShowExec) fetchShowTables() error {
 	if !e.is.SchemaExists(e.DBName) {
 		return errors.Errorf("Can not find DB: %s", e.DBName)
 	}
+	checker := privilege.GetPrivilegeManager(e.ctx)
 	// sort for tables
 	var tableNames []string
 	for _, v := range e.is.SchemaTables(e.DBName) {
+		// Test with mysql.AllPrivMask means any privilege would be OK.
+		// TODO: Should consider column privileges, which also make a table visible.
+		if checker != nil && !checker.RequestVerification(e.DBName.O, v.Meta().Name.O, "", mysql.AllPrivMask) {
+			continue
+		}
 		tableNames = append(tableNames, v.Meta().Name.O)
 	}
 	sort.Strings(tableNames)
@@ -319,6 +322,7 @@ func (e *ShowExec) fetchShowIndex() error {
 	return nil
 }
 
+// fetchShowCharset gets all charset information and fill them into e.rows.
 // See http://dev.mysql.com/doc/refman/5.7/en/show-character-set.html
 func (e *ShowExec) fetchShowCharset() error {
 	descs := charset.GetAllCharsets()
@@ -494,9 +498,17 @@ func (e *ShowExec) fetchShowCreateTable() error {
 	buf.WriteString("\n")
 
 	buf.WriteString(") ENGINE=InnoDB")
-	if s := tb.Meta().Charset; len(s) > 0 {
-		buf.WriteString(fmt.Sprintf(" DEFAULT CHARSET=%s", s))
+	charsetName := tb.Meta().Charset
+	if len(charsetName) == 0 {
+		charsetName = charset.CharsetUTF8
 	}
+	collate := tb.Meta().Collate
+	if len(collate) == 0 {
+		collate = charset.CollationUTF8
+	}
+	// Because we only support case sensitive utf8_bin collate, we need to explicitly set the default charset and collation
+	// to make it work on MySQL server which has default collate utf8_general_ci.
+	buf.WriteString(fmt.Sprintf(" DEFAULT CHARSET=%s COLLATE=%s", charsetName, collate))
 
 	if tb.Meta().AutoIncID > 0 {
 		buf.WriteString(fmt.Sprintf(" AUTO_INCREMENT=%d", tb.Meta().AutoIncID))
@@ -511,7 +523,7 @@ func (e *ShowExec) fetchShowCreateTable() error {
 	return nil
 }
 
-// Compose show create database result.
+// fetchShowCreateDatabase composes show create database result.
 func (e *ShowExec) fetchShowCreateDatabase() error {
 	db, ok := e.is.SchemaByName(e.DBName)
 	if !ok {
@@ -551,7 +563,7 @@ func (e *ShowExec) fetchShowCollation() error {
 
 func (e *ShowExec) fetchShowGrants() error {
 	// Get checker
-	checker := privilege.GetPrivilegeChecker(e.ctx)
+	checker := privilege.GetPrivilegeManager(e.ctx)
 	if checker == nil {
 		return errors.New("miss privilege checker")
 	}
@@ -602,9 +614,4 @@ func (e *ShowExec) getTable() (table.Table, error) {
 		return nil, errors.Errorf("table %s not found", e.Table.Name)
 	}
 	return tb, nil
-}
-
-// Close implements the Executor Close interface.
-func (e *ShowExec) Close() error {
-	return nil
 }

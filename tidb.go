@@ -66,7 +66,8 @@ func (dm *domainMap) Get(store kv.Storage) (d *domain.Domain, err error) {
 	}
 	err = util.RunWithRetry(defaultMaxRetries, retryInterval, func() (retry bool, err1 error) {
 		log.Infof("store %v new domain, lease %v", store.UUID(), lease)
-		d, err1 = domain.NewDomain(store, lease)
+		factory := createSessionFunc(store)
+		d, err1 = domain.NewDomain(store, lease, factory)
 		return true, errors.Trace(err1)
 	})
 	if err != nil {
@@ -148,6 +149,13 @@ func resetStmtCtx(ctx context.Context, s ast.StmtNode) {
 		// Make sure the sql_mode is strict when checking column default value.
 		sc.IgnoreTruncate = false
 		sc.TruncateAsWarning = false
+	case *ast.LoadDataStmt:
+		if variable.GoSQLDriverTest {
+			sc.IgnoreTruncate = true
+			break
+		}
+		sc.IgnoreTruncate = false
+		sc.TruncateAsWarning = !sessVars.StrictSQLMode
 	default:
 		sc.IgnoreTruncate = true
 		if show, ok := s.(*ast.ShowStmt); ok {
@@ -157,6 +165,11 @@ func resetStmtCtx(ctx context.Context, s ast.StmtNode) {
 			}
 		}
 	}
+	if sessVars.LastInsertID > 0 {
+		sessVars.PrevLastInsertID = sessVars.LastInsertID
+		sessVars.LastInsertID = 0
+	}
+	sessVars.InsertID = 0
 	sessVars.StmtCtx = sc
 }
 

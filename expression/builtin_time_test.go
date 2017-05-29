@@ -249,6 +249,16 @@ func (s *testEvaluatorSuite) TestDate(c *C) {
 func (s *testEvaluatorSuite) TestDateFormat(c *C) {
 	defer testleak.AfterTest(c)()
 
+	// Test case for https://github.com/pingcap/tidb/issues/2908
+	// SELECT DATE_FORMAT(null,'%Y-%M-%D')
+	args := []types.Datum{types.NewDatum(nil), types.NewStringDatum("%Y-%M-%D")}
+	fc := funcs[ast.DateFormat]
+	f, err := fc.getFunction(datumsToConstants(args), s.ctx)
+	c.Assert(err, IsNil)
+	v, err := f.eval(nil)
+	c.Assert(err, IsNil)
+	c.Assert(v.IsNull(), Equals, true)
+
 	tblDate := []struct {
 		Input  []string
 		Expect interface{}
@@ -601,6 +611,33 @@ func (s *testEvaluatorSuite) TestCurrentTime(c *C) {
 	c.Assert(err, NotNil)
 }
 
+func (s *testEvaluatorSuite) TestUTCTime(c *C) {
+	defer testleak.AfterTest(c)()
+
+	tfStr := "15:04:05"
+	last := time.Now().UTC()
+	fc := funcs[ast.UTCTime]
+
+	tests := []struct {
+		param  interface{}
+		expect int
+	}{{nil, 8}, {0, 8}, {3, 12}, {6, 15}, {-1, 0}, {7, 0}}
+
+	for _, test := range tests {
+		f, err := fc.getFunction(datumsToConstants(types.MakeDatums(test.param)), s.ctx)
+		c.Assert(err, IsNil)
+		v, err := f.eval(nil)
+		if test.expect > 0 {
+			c.Assert(err, IsNil)
+			n := v.GetMysqlDuration()
+			c.Assert(n.String(), HasLen, test.expect)
+			c.Assert(n.String(), GreaterEqual, last.Format(tfStr))
+		} else {
+			c.Assert(err, NotNil)
+		}
+	}
+}
+
 func (s *testEvaluatorSuite) TestUTCDate(c *C) {
 	defer testleak.AfterTest(c)()
 	last := time.Now().UTC()
@@ -886,6 +923,15 @@ func (s *testEvaluatorSuite) TestUnixTimestamp(c *C) {
 	c.Assert(d.GetInt64()-time.Now().Unix(), GreaterEqual, int64(-1))
 	c.Assert(d.GetInt64()-time.Now().Unix(), LessEqual, int64(1))
 
+	// Test case for https://github.com/pingcap/tidb/issues/2852
+	// select UNIX_TIMESTAMP(null);
+	args = []types.Datum{types.NewDatum(nil)}
+	f, err = fc.getFunction(datumsToConstants(args), s.ctx)
+	c.Assert(err, IsNil)
+	d, err = f.eval(nil)
+	c.Assert(err, IsNil)
+	c.Assert(d.IsNull(), Equals, true)
+
 	// Set the time_zone variable, because UnixTimestamp() result depends on it.
 	s.ctx.GetSessionVars().TimeZone = time.UTC
 	tests := []struct {
@@ -993,4 +1039,487 @@ func (s *testEvaluatorSuite) TestTimestamp(c *C) {
 	d, err := f.eval(nil)
 	c.Assert(err, IsNil)
 	c.Assert(d.Kind(), Equals, types.KindNull)
+}
+
+func (s *testEvaluatorSuite) TestMakeDate(c *C) {
+	defer testleak.AfterTest(c)()
+	tbl := []struct {
+		Args []interface{}
+		Want interface{}
+	}{
+		{[]interface{}{71, 1}, "1971-01-01"},
+		{[]interface{}{99, 1}, "1999-01-01"},
+		{[]interface{}{100, 1}, "0100-01-01"},
+		{[]interface{}{69, 1}, "2069-01-01"},
+		{[]interface{}{70, 1}, "1970-01-01"},
+		{[]interface{}{1000, 1}, "1000-01-01"},
+		{[]interface{}{-1, 3660}, nil},
+		{[]interface{}{10000, 3660}, nil},
+		{[]interface{}{2060, 2900025}, "9999-12-31"},
+		{[]interface{}{2060, 2900026}, nil},
+		{[]interface{}{nil, 2900025}, nil},
+		{[]interface{}{2060, nil}, nil},
+		{[]interface{}{nil, nil}, nil},
+		{[]interface{}{"71", 1}, "1971-01-01"},
+		{[]interface{}{71, "1"}, "1971-01-01"},
+		{[]interface{}{"71", "1"}, "1971-01-01"},
+	}
+	Dtbl := tblToDtbl(tbl)
+	maketime := funcs[ast.MakeDate]
+	for idx, t := range Dtbl {
+		f, err := maketime.getFunction(datumsToConstants(t["Args"]), s.ctx)
+		c.Assert(err, IsNil)
+		got, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		if t["Want"][0].Kind() == types.KindNull {
+			c.Assert(got.Kind(), Equals, types.KindNull, Commentf("[%v] - args:%v", idx, t["Args"]))
+		} else {
+			want, err := t["Want"][0].ToString()
+			c.Assert(err, IsNil)
+			c.Assert(got.GetMysqlTime().String(), Equals, want, Commentf("[%v] - args:%v", idx, t["Args"]))
+		}
+	}
+}
+
+func (s *testEvaluatorSuite) TestMakeTime(c *C) {
+	defer testleak.AfterTest(c)()
+	tbl := []struct {
+		Args []interface{}
+		Want interface{}
+	}{
+		{[]interface{}{12, 15, 30}, "12:15:30"},
+		{[]interface{}{25, 15, 30}, "25:15:30"},
+		{[]interface{}{-25, 15, 30}, "-25:15:30"},
+		{[]interface{}{12, -15, 30}, nil},
+		{[]interface{}{12, 15, -30}, nil},
+
+		{[]interface{}{12, 15, "30.10"}, "12:15:30.100000"},
+		{[]interface{}{12, 15, "30.00"}, "12:15:30.000000"},
+		{[]interface{}{12, 15, 30.0000001}, "12:15:30.000000"},
+		{[]interface{}{12, 15, 30.0000005}, "12:15:30.000001"},
+		{[]interface{}{"12", "15", 30.1}, "12:15:30.1"},
+
+		{[]interface{}{0, 58.4, 0}, "00:58:00"},
+		{[]interface{}{0, "58.4", 0}, "00:58:00"},
+		{[]interface{}{0, 58.5, 1}, "00:59:01"},
+		{[]interface{}{0, "58.5", 1}, "00:58:01"},
+		{[]interface{}{0, 59.5, 1}, nil},
+		{[]interface{}{0, "59.5", 1}, "00:59:01"},
+		{[]interface{}{0, 1, 59.1}, "00:01:59.1"},
+		{[]interface{}{0, 1, "59.1"}, "00:01:59.100000"},
+		{[]interface{}{0, 1, 59.5}, "00:01:59.5"},
+		{[]interface{}{0, 1, "59.5"}, "00:01:59.500000"},
+		{[]interface{}{23.5, 1, 10}, "24:01:10"},
+		{[]interface{}{"23.5", 1, 10}, "23:01:10"},
+
+		{[]interface{}{0, 0, 0}, "00:00:00"},
+		{[]interface{}{"", "", ""}, "00:00:00.000000"},
+		{[]interface{}{"h", "m", "s"}, "00:00:00.000000"},
+
+		{[]interface{}{837, 59, 59.1}, "837:59:59.1"},
+		{[]interface{}{838, 59, 59.1}, "838:59:59.0"},
+		{[]interface{}{-838, 59, 59.1}, "-838:59:59.0"},
+		{[]interface{}{1000, 1, 1}, "838:59:59"},
+		{[]interface{}{-1000, 1, 1.23}, "-838:59:59.00"},
+		{[]interface{}{1000, 59.1, 1}, "838:59:59"},
+		{[]interface{}{1000, 59.5, 1}, nil},
+		{[]interface{}{1000, 1, 59.1}, "838:59:59.0"},
+		{[]interface{}{1000, 1, 59.5}, "838:59:59.0"},
+
+		{[]interface{}{12, 15, 60}, nil},
+		{[]interface{}{12, 15, "60"}, nil},
+		{[]interface{}{12, 60, 0}, nil},
+		{[]interface{}{12, "60", 0}, nil},
+
+		{[]interface{}{12, 15, nil}, nil},
+		{[]interface{}{12, nil, 0}, nil},
+		{[]interface{}{nil, 15, 0}, nil},
+		{[]interface{}{nil, nil, nil}, nil},
+	}
+
+	Dtbl := tblToDtbl(tbl)
+	maketime := funcs[ast.MakeTime]
+	for idx, t := range Dtbl {
+		f, err := maketime.getFunction(datumsToConstants(t["Args"]), s.ctx)
+		c.Assert(err, IsNil)
+		got, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		if t["Want"][0].Kind() == types.KindNull {
+			c.Assert(got.Kind(), Equals, types.KindNull, Commentf("[%v] - args:%v", idx, t["Args"]))
+		} else {
+			want, err := t["Want"][0].ToString()
+			c.Assert(err, IsNil)
+			c.Assert(got.GetMysqlDuration().String(), Equals, want, Commentf("[%v] - args:%v", idx, t["Args"]))
+		}
+	}
+}
+
+func (s *testEvaluatorSuite) TestQuarter(c *C) {
+	tests := []struct {
+		t      string
+		expect int64
+	}{
+		// Test case from https://dev.mysql.com/doc/refman/5.7/en/date-and-time-functions.html#function_quarter
+		{"2008-04-01", 2},
+		// Test case for boundary values
+		{"2008-01-01", 1},
+		{"2008-03-31", 1},
+		{"2008-06-30", 2},
+		{"2008-07-01", 3},
+		{"2008-09-30", 3},
+		{"2008-10-01", 4},
+		{"2008-12-31", 4},
+		// Test case for month 0
+		{"2008-00-01", 0},
+	}
+	fc := funcs["quarter"]
+	for _, test := range tests {
+		arg := types.NewStringDatum(test.t)
+		f, err := fc.getFunction(datumsToConstants([]types.Datum{arg}), s.ctx)
+		c.Assert(err, IsNil)
+		result, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		c.Assert(result.GetInt64(), Equals, test.expect)
+	}
+
+	// test invalid input
+	argInvalid := types.NewStringDatum("2008-13-01")
+	f, err := fc.getFunction(datumsToConstants([]types.Datum{argInvalid}), s.ctx)
+	c.Assert(err, IsNil)
+	result, err := f.eval(nil)
+	c.Assert(err, NotNil)
+	c.Assert(result.IsNull(), IsTrue)
+}
+
+func (s *testEvaluatorSuite) TestGetFormat(c *C) {
+	tests := []struct {
+		unit     string
+		location string
+		expect   string
+	}{
+		{"DATE", "USA", "%m.%d.%Y"},
+		{"DATE", "JIS", "%Y-%m-%d"},
+		{"DATE", "ISO", "%Y-%m-%d"},
+		{"DATE", "EUR", "%d.%m.%Y"},
+		{"DATE", "INTERNAL", "%Y%m%d"},
+
+		{"DATETIME", "USA", "%Y-%m-%d %H.%i.%s"},
+		{"DATETIME", "JIS", "%Y-%m-%d %H:%i:%s"},
+		{"DATETIME", "ISO", "%Y-%m-%d %H:%i:%s"},
+		{"DATETIME", "EUR", "%Y-%m-%d %H.%i.%s"},
+		{"DATETIME", "INTERNAL", "%Y%m%d%H%i%s"},
+
+		{"TIME", "USA", "%h:%i:%s %p"},
+		{"TIME", "JIS", "%H:%i:%s"},
+		{"TIME", "ISO", "%H:%i:%s"},
+		{"TIME", "EUR", "%H.%i.%s"},
+		{"TIME", "INTERNAL", "%H%i%s"},
+	}
+
+	fc := funcs[ast.GetFormat]
+	for _, test := range tests {
+		t := []types.Datum{types.NewStringDatum(test.unit), types.NewStringDatum(test.location)}
+		f, err := fc.getFunction(datumsToConstants(t), s.ctx)
+		c.Assert(err, IsNil)
+		d, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		result, _ := d.ToString()
+		c.Assert(result, Equals, test.expect)
+	}
+}
+
+func (s *testEvaluatorSuite) TestToSeconds(c *C) {
+	tests := []struct {
+		param  interface{}
+		expect int64
+	}{
+		{950501, 62966505600},
+		{"2009-11-29", 63426672000},
+		{"2009-11-29 13:43:32", 63426721412},
+		{"09-11-29 13:43:32", 63426721412},
+		{"99-11-29 13:43:32", 63111102212},
+	}
+
+	fc := funcs[ast.ToSeconds]
+	for _, test := range tests {
+		t := []types.Datum{types.NewDatum(test.param)}
+		f, err := fc.getFunction(datumsToConstants(t), s.ctx)
+		c.Assert(err, IsNil)
+		d, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		c.Assert(d.GetInt64(), Equals, test.expect)
+	}
+
+	testsNull := []interface{}{
+		"0000-00-00",
+		"1992-13-00",
+		"2007-10-07 23:59:61",
+		123456789}
+
+	for _, i := range testsNull {
+		t := []types.Datum{types.NewDatum(i)}
+		f, err := fc.getFunction(datumsToConstants(t), s.ctx)
+		c.Assert(err, IsNil)
+		d, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		c.Assert(d.IsNull(), IsTrue)
+	}
+}
+
+func (s *testEvaluatorSuite) TestToDays(c *C) {
+	tests := []struct {
+		param  interface{}
+		expect int64
+	}{
+		{950501, 728779},
+		{"2007-10-07", 733321},
+		{"2008-10-07", 733687},
+		{"08-10-07", 733687},
+		{"0000-01-01", 1},
+		{"2007-10-07 00:00:59", 733321},
+	}
+
+	fc := funcs[ast.ToDays]
+	for _, test := range tests {
+		t := []types.Datum{types.NewDatum(test.param)}
+		f, err := fc.getFunction(datumsToConstants(t), s.ctx)
+		c.Assert(err, IsNil)
+		d, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		c.Assert(d.GetInt64(), Equals, test.expect)
+	}
+
+	testsNull := []interface{}{
+		"0000-00-00",
+		"1992-13-00",
+		"2007-10-07 23:59:61",
+		123456789}
+
+	for _, i := range testsNull {
+		t := []types.Datum{types.NewDatum(i)}
+		f, err := fc.getFunction(datumsToConstants(t), s.ctx)
+		c.Assert(err, IsNil)
+		d, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		c.Assert(d.IsNull(), IsTrue)
+	}
+}
+
+func (s *testEvaluatorSuite) TestTimestampAdd(c *C) {
+	tests := []struct {
+		unit     string
+		interval int64
+		date     interface{}
+		expect   string
+	}{
+		{"MINUTE", 1, "2003-01-02", "2003-01-02 00:01:00"},
+		{"WEEK", 1, "2003-01-02 23:59:59", "2003-01-09 23:59:59"},
+		{"MICROSECOND", 1, 950501, "1995-05-01 00:00:00.000001"},
+	}
+
+	fc := funcs[ast.TimestampAdd]
+	for _, test := range tests {
+		t := []types.Datum{types.NewStringDatum(test.unit), types.NewIntDatum(test.interval), types.NewDatum(test.date)}
+		f, err := fc.getFunction(datumsToConstants(t), s.ctx)
+		c.Assert(err, IsNil)
+		d, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		result, _ := d.ToString()
+		c.Assert(result, Equals, test.expect)
+	}
+}
+
+func (s *testEvaluatorSuite) TestPeriodAdd(c *C) {
+	tests := []struct {
+		Period  int64
+		Months  int64
+		Success bool
+		Expect  int64
+	}{
+		{201611, 2, true, 201701},
+		{201611, 3, true, 201702},
+		{201611, -13, true, 201510},
+		{1611, 3, true, 201702},
+		{7011, 3, true, 197102},
+		{12323, 10, true, 12509},
+		{0, 3, true, 0},
+	}
+
+	fc := funcs[ast.PeriodAdd]
+	for _, test := range tests {
+		period := types.NewIntDatum(test.Period)
+		months := types.NewIntDatum(test.Months)
+		f, err := fc.getFunction(datumsToConstants([]types.Datum{period, months}), s.ctx)
+		c.Assert(err, IsNil)
+		result, err := f.eval(nil)
+		if !test.Success {
+			c.Assert(result.IsNull(), IsTrue)
+			continue
+		}
+		c.Assert(err, IsNil)
+		c.Assert(result.Kind(), Equals, types.KindInt64)
+		value := result.GetInt64()
+		c.Assert(value, Equals, test.Expect)
+	}
+}
+
+func (s *testEvaluatorSuite) TestTimeToSec(c *C) {
+	tests := []struct {
+		t      string
+		expect int64
+	}{
+		{"22:23:00", 80580},
+		{"00:39:38", 2378},
+		{"23:00", 82800},
+		{"00:00", 0},
+		{"00:00:00", 0},
+		{"23:59:59", 86399},
+		{"1:0", 3600},
+		{"1:00", 3600},
+		{"1:0:0", 3600},
+		{"-02:00", -7200},
+	}
+	fc := funcs[ast.TimeToSec]
+	for _, test := range tests {
+		arg := types.NewStringDatum(test.t)
+		f, err := fc.getFunction(datumsToConstants([]types.Datum{arg}), s.ctx)
+		c.Assert(err, IsNil)
+		result, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		c.Assert(result.GetInt64(), Equals, test.expect)
+	}
+}
+
+func (s *testEvaluatorSuite) TestSecToTime(c *C) {
+	// Test cases from https://dev.mysql.com/doc/refman/5.7/en/date-and-time-functions.html#function_sec-to-time
+	fc := funcs[ast.SecToTime]
+	//test nil
+	nilDatum := types.NewDatum(nil)
+	f, err := fc.getFunction(datumsToConstants([]types.Datum{nilDatum}), s.ctx)
+	c.Assert(err, IsNil)
+	d, err := f.eval(nil)
+	c.Assert(err, IsNil)
+	c.Assert(d.Kind(), Equals, types.KindNull)
+
+	tests := []struct {
+		param  interface{}
+		expect string
+	}{
+		{2378, "00:39:38"},
+		{3864000, "838:59:59"},
+		{-3864000, "-838:59:59"},
+		{86401.4, "24:00:01.4"},
+		{-86401.4, "-24:00:01.4"},
+		{86401.54321, "24:00:01.54321"},
+		{"123.4", "00:02:03.400000"},
+		{"123.4567891", "00:02:03.456789"},
+		{"123", "00:02:03.000000"},
+		{"abc", "00:00:00.000000"},
+	}
+	for _, test := range tests {
+		t := []types.Datum{types.NewDatum(test.param)}
+		f, err := fc.getFunction(datumsToConstants(t), s.ctx)
+		c.Assert(err, IsNil)
+		d, err := f.eval(nil)
+		c.Assert(err, IsNil)
+		result, _ := d.ToString()
+		c.Assert(result, Equals, test.expect)
+	}
+}
+
+func (s *testEvaluatorSuite) TestConvertTz(c *C) {
+	tests := []struct {
+		t       interface{}
+		fromTz  string
+		toTz    string
+		Success bool
+		expect  string
+	}{
+		{"2004-01-01 12:00:00.111", "-00:00", "+12:34", true, "2004-01-02 00:34:00.111"},
+		{"2004-01-01 12:00:00.11", "+00:00", "+12:34", true, "2004-01-02 00:34:00.11"},
+		{"2004-01-01 12:00:00.11111111111", "-00:00", "+12:34", true, "2004-01-02 00:34:00.111111"},
+		{"2004-01-01 12:00:00", "GMT", "MET", true, "2004-01-01 13:00:00"},
+		{"2004-01-01 12:00:00", "-01:00", "-12:00", true, "2004-01-01 01:00:00"},
+		{"2004-01-01 12:00:00", "-00:00", "+13:00", true, "2004-01-02 01:00:00"},
+		{"2004-01-01 12:00:00", "-00:00", "-13:00", true, ""},
+		{"2004-01-01 12:00:00", "-00:00", "-12:88", true, ""},
+		{"2004-01-01 12:00:00", "+10:82", "GMT", false, ""},
+		{"2004-01-01 12:00:00", "+00:00", "GMT", true, ""},
+		{"2004-01-01 12:00:00", "GMT", "+00:00", true, ""},
+		{20040101, "+00:00", "+10:32", true, "2004-01-01 10:32:00"},
+		{3.14159, "+00:00", "+10:32", false, ""},
+	}
+	fc := funcs[ast.ConvertTz]
+	for _, test := range tests {
+		f, err := fc.getFunction(
+			datumsToConstants(
+				[]types.Datum{
+					types.NewDatum(test.t),
+					types.NewStringDatum(test.fromTz),
+					types.NewStringDatum(test.toTz)}),
+			s.ctx)
+		c.Assert(err, IsNil)
+		d, err := f.eval(nil)
+		if test.Success {
+			c.Assert(err, IsNil)
+		} else {
+			c.Assert(err, NotNil)
+		}
+		result, _ := d.ToString()
+		c.Assert(result, Equals, test.expect)
+	}
+}
+
+func (s *testEvaluatorSuite) TestPeriodDiff(c *C) {
+	tests := []struct {
+		Period1 int64
+		Period2 int64
+		Success bool
+		Expect  int64
+	}{
+		{201611, 201611, true, 0},
+		{200802, 200703, true, 11},
+		{0, 999999999, true, -120000086},
+		{9999999, 0, true, 1200086},
+		{411, 200413, true, -2},
+		{197000, 207700, true, -1284},
+		{201701, 201611, true, 2},
+		{201702, 201611, true, 3},
+		{201510, 201611, true, -13},
+		{201702, 1611, true, 3},
+		{197102, 7011, true, 3},
+		{12509, 12323, true, 10},
+		{12509, 12323, true, 10},
+	}
+
+	fc := funcs[ast.PeriodDiff]
+	for _, test := range tests {
+		period1 := types.NewIntDatum(test.Period1)
+		period2 := types.NewIntDatum(test.Period2)
+		f, err := fc.getFunction(datumsToConstants([]types.Datum{period1, period2}), s.ctx)
+		c.Assert(err, IsNil)
+		result, err := f.eval(nil)
+		if !test.Success {
+			c.Assert(result.IsNull(), IsTrue)
+			continue
+		}
+		c.Assert(err, IsNil)
+		c.Assert(result.Kind(), Equals, types.KindInt64)
+		value := result.GetInt64()
+		c.Assert(value, Equals, test.Expect)
+	}
+	// nil
+	args := []types.Datum{types.NewDatum(nil), types.NewIntDatum(0)}
+	f, err := fc.getFunction(datumsToConstants(args), s.ctx)
+	c.Assert(err, IsNil)
+	v, err := f.eval(nil)
+	c.Assert(err, IsNil)
+	c.Assert(v.Kind(), Equals, types.KindNull)
+
+	args = []types.Datum{types.NewIntDatum(0), types.NewDatum(nil)}
+	f, err = fc.getFunction(datumsToConstants(args), s.ctx)
+	c.Assert(err, IsNil)
+	v, err = f.eval(nil)
+	c.Assert(err, IsNil)
+	c.Assert(v.Kind(), Equals, types.KindNull)
 }

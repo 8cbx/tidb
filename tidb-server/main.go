@@ -45,7 +45,7 @@ import (
 
 var (
 	version         = flag.Bool("V", false, "print version information and exit")
-	store           = flag.String("store", "goleveldb", "registered store name, [memory, goleveldb, boltdb, tikv]")
+	store           = flag.String("store", "goleveldb", "registered store name, [memory, goleveldb, boltdb, tikv, mocktikv]")
 	storePath       = flag.String("path", "/tmp/tidb", "tidb storage path")
 	logLevel        = flag.String("L", "info", "log level: info, debug, warn, error, fatal")
 	host            = flag.String("host", "0.0.0.0", "tidb server host")
@@ -54,7 +54,7 @@ var (
 	lease           = flag.String("lease", "1s", "schema lease duration, very dangerous to change only if you know what you do")
 	socket          = flag.String("socket", "", "The socket file to use for connection.")
 	enablePS        = flag.Bool("perfschema", false, "If enable performance schema.")
-	enablePrivilege = flag.Bool("privilege", false, "If enable privilege check feature.")
+	enablePrivilege = flag.Bool("privilege", true, "If enable privilege check feature. This flag will be removed in the future.")
 	reportStatus    = flag.Bool("report-status", true, "If enable status report HTTP service.")
 	logFile         = flag.String("log-file", "", "log file path")
 	joinCon         = flag.Int("join-concurrency", 5, "the number of goroutines that participate joining.")
@@ -64,6 +64,7 @@ var (
 	binlogSocket    = flag.String("binlog-socket", "", "socket file to write binlog")
 	runDDL          = flag.Bool("run-ddl", true, "run ddl worker on this tidb-server")
 	retryLimit      = flag.Int("retry-limit", 10, "the maximum number of retries when commit a transaction")
+	skipGrantTable  = flag.Bool("skip-grant-table", false, "This option causes the server to start without using the privilege system at all.")
 
 	timeJumpBackCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
@@ -77,6 +78,7 @@ var (
 func main() {
 	tidb.RegisterLocalStore("boltdb", boltdb.Driver{})
 	tidb.RegisterStore("tikv", tikv.Driver{})
+	tidb.RegisterStore("mocktikv", tikv.MockDriver{})
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
@@ -84,6 +86,10 @@ func main() {
 	if *version {
 		printer.PrintRawTiDBInfo()
 		os.Exit(0)
+	}
+	if *skipGrantTable && !hasRootPrivilege() {
+		log.Error("TiDB run with skip-grant-table need root privilege.")
+		os.Exit(-1)
 	}
 
 	leaseDuration := parseLease()
@@ -97,6 +103,8 @@ func main() {
 		StatusAddr:   fmt.Sprintf(":%s", *statusPort),
 		Socket:       *socket,
 		ReportStatus: *reportStatus,
+		Store:        *store,
+		StorePath:    *storePath,
 	}
 
 	// set log options
@@ -123,12 +131,13 @@ func main() {
 		perfschema.EnablePerfSchema()
 	}
 	privileges.Enable = *enablePrivilege
+	privileges.SkipWithGrant = *skipGrantTable
 	if *binlogSocket != "" {
 		createBinlogClient()
 	}
 
 	// Bootstrap a session to load information schema.
-	_, err := tidb.BootstrapSession(store)
+	domain, err := tidb.BootstrapSession(store)
 	if err != nil {
 		log.Fatal(errors.ErrorStack(err))
 	}
@@ -152,7 +161,6 @@ func main() {
 		sig := <-sc
 		log.Infof("Got signal [%d] to exit.", sig)
 		svr.Close()
-		os.Exit(0)
 	}()
 
 	prometheus.MustRegister(timeJumpBackCounter)
@@ -163,6 +171,8 @@ func main() {
 	pushMetric(*metricsAddr, time.Duration(*metricsInterval)*time.Second)
 
 	log.Error(svr.Run())
+	domain.Close()
+	os.Exit(0)
 }
 
 func createStore() kv.Storage {
@@ -183,6 +193,7 @@ func createBinlogClient() {
 		log.Fatal(errors.ErrorStack(err))
 	}
 	binloginfo.PumpClient = binlog.NewPumpClient(clientCon)
+	log.Infof("created binlog client at %s", *binlogSocket)
 }
 
 // Prometheus push.
@@ -225,4 +236,8 @@ func parseLease() time.Duration {
 		log.Fatalf("invalid lease duration %s", *lease)
 	}
 	return dur
+}
+
+func hasRootPrivilege() bool {
+	return os.Geteuid() == 0
 }

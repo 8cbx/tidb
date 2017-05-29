@@ -16,6 +16,7 @@ package executor_test
 import (
 	"errors"
 	"fmt"
+	"sync/atomic"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/ast"
@@ -24,6 +25,7 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/types"
@@ -396,9 +398,7 @@ func (s *testSuite) TestUpdate(c *C) {
 	// select data
 	tk.MustExec("begin")
 	r := tk.MustQuery(`SELECT * from update_test limit 2;`)
-	rowStr1 := fmt.Sprintf("%v %v", 1, []byte("abc"))
-	rowStr2 := fmt.Sprintf("%v %v", 2, []byte("abc"))
-	r.Check(testkit.Rows(rowStr1, rowStr2))
+	r.Check(testkit.Rows("1 abc", "2 abc"))
 	tk.MustExec("commit")
 
 	tk.MustExec(`UPDATE update_test SET name = "foo"`)
@@ -416,9 +416,7 @@ func (s *testSuite) TestUpdate(c *C) {
 	tk.MustExec("commit")
 	tk.MustExec("begin")
 	r = tk.MustQuery("select * from update_test;")
-	rowStr1 = fmt.Sprintf("%v %v", 8, []byte("aa"))
-	rowStr2 = fmt.Sprintf("%v %v", 9, []byte("bb"))
-	r.Check(testkit.Rows(rowStr1, rowStr2))
+	r.Check(testkit.Rows("8 aa", "9 bb"))
 	tk.MustExec("commit")
 
 	tk.MustExec("begin")
@@ -473,30 +471,21 @@ func (s *testSuite) TestMultipleTableUpdate(c *C) {
 	tk.MustExec(`UPDATE items, month  SET items.price=month.mprice WHERE items.id=month.mid;`)
 	tk.MustExec("begin")
 	r := tk.MustQuery("SELECT * FROM items")
-	rowStr1 := fmt.Sprintf("%v %v", 11, []byte("month_price_11"))
-	rowStr2 := fmt.Sprintf("%v %v", 12, []byte("items_price_12"))
-	rowStr3 := fmt.Sprintf("%v %v", 13, []byte("month_price_13"))
-	r.Check(testkit.Rows(rowStr1, rowStr2, rowStr3))
+	r.Check(testkit.Rows("11 month_price_11", "12 items_price_12", "13 month_price_13"))
 	tk.MustExec("commit")
 
 	// Single-table syntax but with multiple tables
 	tk.MustExec(`UPDATE items join month on items.id=month.mid SET items.price=month.mid;`)
 	tk.MustExec("begin")
 	r = tk.MustQuery("SELECT * FROM items")
-	rowStr1 = fmt.Sprintf("%v %v", 11, []byte("11"))
-	rowStr2 = fmt.Sprintf("%v %v", 12, []byte("items_price_12"))
-	rowStr3 = fmt.Sprintf("%v %v", 13, []byte("13"))
-	r.Check(testkit.Rows(rowStr1, rowStr2, rowStr3))
+	r.Check(testkit.Rows("11 11", "12 items_price_12", "13 13"))
 	tk.MustExec("commit")
 
 	// JoinTable with alias table name.
 	tk.MustExec(`UPDATE items T0 join month T1 on T0.id=T1.mid SET T0.price=T1.mprice;`)
 	tk.MustExec("begin")
 	r = tk.MustQuery("SELECT * FROM items")
-	rowStr1 = fmt.Sprintf("%v %v", 11, []byte("month_price_11"))
-	rowStr2 = fmt.Sprintf("%v %v", 12, []byte("items_price_12"))
-	rowStr3 = fmt.Sprintf("%v %v", 13, []byte("month_price_13"))
-	r.Check(testkit.Rows(rowStr1, rowStr2, rowStr3))
+	r.Check(testkit.Rows("11 month_price_11", "12 items_price_12", "13 month_price_13"))
 	tk.MustExec("commit")
 
 	// fix https://github.com/pingcap/tidb/issues/369
@@ -547,8 +536,7 @@ func (s *testSuite) TestDelete(c *C) {
 	// Select data
 	tk.MustExec("begin")
 	rows := tk.MustQuery(`SELECT * from delete_test limit 2;`)
-	rowStr := fmt.Sprintf("%v %v", "1", []byte("hello"))
-	rows.Check(testkit.Rows(rowStr))
+	rows.Check(testkit.Rows("1 hello"))
 	tk.MustExec("commit")
 
 	tk.MustExec(`delete from delete_test ;`)
@@ -644,7 +632,7 @@ func (s *testSuite) TestLoadData(c *C) {
 	c.Assert(err, NotNil)
 	tk.MustExec("load data local infile '/tmp/nonexistence.csv' into table load_data_test")
 	ctx := tk.Se.(context.Context)
-	ld := makeLoadDataInfo(4, ctx, c)
+	ld := makeLoadDataInfo(4, nil, ctx, c)
 
 	deleteSQL := "delete from load_data_test"
 	selectSQL := "select * from load_data_test;"
@@ -655,160 +643,141 @@ func (s *testSuite) TestLoadData(c *C) {
 	r := tk.MustQuery(selectSQL)
 	r.Check(nil)
 
+	sc := ctx.GetSessionVars().StmtCtx
+	originIgnoreTruncate := sc.IgnoreTruncate
+	defer func() {
+		sc.IgnoreTruncate = originIgnoreTruncate
+	}()
+	sc.IgnoreTruncate = false
 	// fields and lines are default, InsertData returns data is nil
-	cases := []testCase{
+	tests := []testCase{
 		// data1 = nil, data2 != nil
-		{nil, []byte("\n"), []string{fmt.Sprintf("%v %v %v %v", 1, 0, []byte(""), 0)}, nil},
-		{nil, []byte("\t\n"), []string{fmt.Sprintf("%v %v %v %v", 2, 0, []byte(""), 0)}, nil},
-		{nil, []byte("3\t2\t3\t4\n"), []string{fmt.Sprintf("%v %v %v %v", 3, 2, []byte("3"), 4)}, nil},
-		{nil, []byte("3*1\t2\t3\t4\n"), []string{fmt.Sprintf("%v %v %v %v", 3, 2, []byte("3"), 4)}, nil},
-		{nil, []byte("4\t2\t\t3\t4\n"), []string{fmt.Sprintf("%v %v %v %v", 4, 2, []byte(""), 3)}, nil},
-		{nil, []byte("\t1\t2\t3\t4\n"), []string{fmt.Sprintf("%v %v %v %v", 5, 1, []byte("2"), 3)}, nil},
-		{nil, []byte("6\t2\t3\n"), []string{fmt.Sprintf("%v %v %v %v", 6, 2, []byte("3"), 0)}, nil},
-		{nil, []byte("\t2\t3\t4\n\t22\t33\t44\n"), []string{
-			fmt.Sprintf("%v %v %v %v", 7, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 8, 22, []byte("33"), 44)}, nil},
-		{nil, []byte("7\t2\t3\t4\n7\t22\t33\t44\n"), []string{
-			fmt.Sprintf("%v %v %v %v", 7, 2, []byte("3"), 4)}, nil},
+		{nil, []byte("\n"), []string{"1|0||0"}, nil},
+		{nil, []byte("\t\n"), []string{"2|0||0"}, nil},
+		{nil, []byte("3\t2\t3\t4\n"), []string{"3|2|3|4"}, nil},
+		{nil, []byte("3*1\t2\t3\t4\n"), []string{"3|2|3|4"}, nil},
+		{nil, []byte("4\t2\t\t3\t4\n"), []string{"4|2||3"}, nil},
+		{nil, []byte("\t1\t2\t3\t4\n"), []string{"5|1|2|3"}, nil},
+		{nil, []byte("6\t2\t3\n"), []string{"6|2|3|0"}, nil},
+		{nil, []byte("\t2\t3\t4\n\t22\t33\t44\n"), []string{"7|2|3|4", "8|22|33|44"}, nil},
+		{nil, []byte("7\t2\t3\t4\n7\t22\t33\t44\n"), []string{"7|2|3|4"}, nil},
 
 		// data1 != nil, data2 = nil
-		{[]byte("\t2\t3\t4"), nil, []string{fmt.Sprintf("%v %v %v %v", 9, 2, []byte("3"), 4)}, nil},
+		{[]byte("\t2\t3\t4"), nil, []string{"9|2|3|4"}, nil},
 
 		// data1 != nil, data2 != nil
-		{[]byte("\t2\t3"), []byte("\t4\t5\n"), []string{fmt.Sprintf("%v %v %v %v", 10, 2, []byte("3"), 4)}, nil},
-		{[]byte("\t2\t3"), []byte("4\t5\n"), []string{fmt.Sprintf("%v %v %v %v", 11, 2, []byte("34"), 5)}, nil},
+		{[]byte("\t2\t3"), []byte("\t4\t5\n"), []string{"10|2|3|4"}, nil},
+		{[]byte("\t2\t3"), []byte("4\t5\n"), []string{"11|2|34|5"}, nil},
 
 		// data1 != nil, data2 != nil, InsertData returns data isn't nil
 		{[]byte("\t2\t3"), []byte("\t4\t5"), nil, []byte("\t2\t3\t4\t5")},
 	}
-	checkCases(cases, ld, c, tk, ctx, selectSQL, deleteSQL)
+	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
+	c.Assert(sc.WarningCount(), Equals, uint16(3))
 
 	// lines starting symbol is "" and terminated symbol length is 2, InsertData returns data is nil
 	ld.LinesInfo.Terminated = "||"
-	cases = []testCase{
+	tests = []testCase{
 		// data1 != nil, data2 != nil
-		{[]byte("0\t2\t3"), []byte("\t4\t5||"), []string{fmt.Sprintf("%v %v %v %v", 12, 2, []byte("3"), 4)}, nil},
-		{[]byte("1\t2\t3\t4\t5|"), []byte("|"), []string{fmt.Sprintf("%v %v %v %v", 1, 2, []byte("3"), 4)}, nil},
-		{[]byte("2\t2\t3\t4\t5|"), []byte("|3\t22\t33\t44\t55||"), []string{
-			fmt.Sprintf("%v %v %v %v", 2, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 3, 22, []byte("33"), 44)}, nil},
+		{[]byte("0\t2\t3"), []byte("\t4\t5||"), []string{"12|2|3|4"}, nil},
+		{[]byte("1\t2\t3\t4\t5|"), []byte("|"), []string{"1|2|3|4"}, nil},
+		{[]byte("2\t2\t3\t4\t5|"), []byte("|3\t22\t33\t44\t55||"),
+			[]string{"2|2|3|4", "3|22|33|44"}, nil},
 		{[]byte("3\t2\t3\t4\t5|"), []byte("|4\t22\t33||"), []string{
-			fmt.Sprintf("%v %v %v %v", 3, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 4, 22, []byte("33"), 0)}, nil},
-		{[]byte("4\t2\t3\t4\t5|"), []byte("|5\t22\t33||6\t222||"), []string{
-			fmt.Sprintf("%v %v %v %v", 4, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 5, 22, []byte("33"), 0),
-			fmt.Sprintf("%v %v %v %v", 6, 222, []byte(""), 0)}, nil},
-		{[]byte("6\t2\t3"), []byte("4\t5||"), []string{fmt.Sprintf("%v %v %v %v", 6, 2, []byte("34"), 5)}, nil},
+			"3|2|3|4", "4|22|33|0"}, nil},
+		{[]byte("4\t2\t3\t4\t5|"), []byte("|5\t22\t33||6\t222||"),
+			[]string{"4|2|3|4", "5|22|33|0", "6|222||0"}, nil},
+		{[]byte("6\t2\t3"), []byte("4\t5||"), []string{"6|2|34|5"}, nil},
 	}
-	checkCases(cases, ld, c, tk, ctx, selectSQL, deleteSQL)
+	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
 
 	// fields and lines aren't default, InsertData returns data is nil
 	ld.FieldsInfo.Terminated = "\\"
 	ld.LinesInfo.Starting = "xxx"
 	ld.LinesInfo.Terminated = "|!#^"
-	cases = []testCase{
+	tests = []testCase{
 		// data1 = nil, data2 != nil
-		{nil, []byte("xxx|!#^"), []string{fmt.Sprintf("%v %v %v %v", 13, 0, []byte(""), 0)}, nil},
-		{nil, []byte("xxx\\|!#^"), []string{fmt.Sprintf("%v %v %v %v", 14, 0, []byte(""), 0)}, nil},
-		{nil, []byte("xxx3\\2\\3\\4|!#^"), []string{fmt.Sprintf("%v %v %v %v", 3, 2, []byte("3"), 4)}, nil},
-		{nil, []byte("xxx4\\2\\\\3\\4|!#^"), []string{fmt.Sprintf("%v %v %v %v", 4, 2, []byte(""), 3)}, nil},
-		{nil, []byte("xxx\\1\\2\\3\\4|!#^"), []string{fmt.Sprintf("%v %v %v %v", 15, 1, []byte("2"), 3)}, nil},
-		{nil, []byte("xxx6\\2\\3|!#^"), []string{fmt.Sprintf("%v %v %v %v", 6, 2, []byte("3"), 0)}, nil},
+		{nil, []byte("xxx|!#^"), []string{"13|0||0"}, nil},
+		{nil, []byte("xxx\\|!#^"), []string{"14|0||0"}, nil},
+		{nil, []byte("xxx3\\2\\3\\4|!#^"), []string{"3|2|3|4"}, nil},
+		{nil, []byte("xxx4\\2\\\\3\\4|!#^"), []string{"4|2||3"}, nil},
+		{nil, []byte("xxx\\1\\2\\3\\4|!#^"), []string{"15|1|2|3"}, nil},
+		{nil, []byte("xxx6\\2\\3|!#^"), []string{"6|2|3|0"}, nil},
 		{nil, []byte("xxx\\2\\3\\4|!#^xxx\\22\\33\\44|!#^"), []string{
-			fmt.Sprintf("%v %v %v %v", 16, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 17, 22, []byte("33"), 44)}, nil},
+			"16|2|3|4",
+			"17|22|33|44"}, nil},
 		{nil, []byte("\\2\\3\\4|!#^\\22\\33\\44|!#^xxx\\222\\333\\444|!#^"), []string{
-			fmt.Sprintf("%v %v %v %v", 18, 222, []byte("333"), 444)}, nil},
+			"18|222|333|444"}, nil},
 
 		// data1 != nil, data2 = nil
-		{[]byte("xxx\\2\\3\\4"), nil, []string{fmt.Sprintf("%v %v %v %v", 19, 2, []byte("3"), 4)}, nil},
+		{[]byte("xxx\\2\\3\\4"), nil, []string{"19|2|3|4"}, nil},
 		{[]byte("\\2\\3\\4|!#^"), nil, []string{}, nil},
 		{[]byte("\\2\\3\\4|!#^xxx18\\22\\33\\44|!#^"), nil,
-			[]string{fmt.Sprintf("%v %v %v %v", 18, 22, []byte("33"), 44)}, nil},
+			[]string{"18|22|33|44"}, nil},
 
 		// data1 != nil, data2 != nil
 		{[]byte("xxx10\\2\\3"), []byte("\\4|!#^"),
-			[]string{fmt.Sprintf("%v %v %v %v", 10, 2, []byte("3"), 4)}, nil},
+			[]string{"10|2|3|4"}, nil},
 		{[]byte("10\\2\\3xx"), []byte("x11\\4\\5|!#^"),
-			[]string{fmt.Sprintf("%v %v %v %v", 11, 4, []byte("5"), 0)}, nil},
+			[]string{"11|4|5|0"}, nil},
 		{[]byte("xxx21\\2\\3\\4\\5|!"), []byte("#^"),
-			[]string{fmt.Sprintf("%v %v %v %v", 21, 2, []byte("3"), 4)}, nil},
-		{[]byte("xxx22\\2\\3\\4\\5|!"), []byte("#^xxx23\\22\\33\\44\\55|!#^"), []string{
-			fmt.Sprintf("%v %v %v %v", 22, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 23, 22, []byte("33"), 44)}, nil},
-		{[]byte("xxx23\\2\\3\\4\\5|!"), []byte("#^xxx24\\22\\33|!#^"), []string{
-			fmt.Sprintf("%v %v %v %v", 23, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 24, 22, []byte("33"), 0)}, nil},
-		{[]byte("xxx24\\2\\3\\4\\5|!"), []byte("#^xxx25\\22\\33|!#^xxx26\\222|!#^"), []string{
-			fmt.Sprintf("%v %v %v %v", 24, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 25, 22, []byte("33"), 0),
-			fmt.Sprintf("%v %v %v %v", 26, 222, []byte(""), 0)}, nil},
-		{[]byte("xxx25\\2\\3\\4\\5|!"), []byte("#^26\\22\\33|!#^xxx27\\222|!#^"), []string{
-			fmt.Sprintf("%v %v %v %v", 25, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 27, 222, []byte(""), 0)}, nil},
-		{[]byte("xxx\\2\\3"), []byte("4\\5|!#^"),
-			[]string{fmt.Sprintf("%v %v %v %v", 28, 2, []byte("34"), 5)}, nil},
+			[]string{"21|2|3|4"}, nil},
+		{[]byte("xxx22\\2\\3\\4\\5|!"), []byte("#^xxx23\\22\\33\\44\\55|!#^"),
+			[]string{"22|2|3|4", "23|22|33|44"}, nil},
+		{[]byte("xxx23\\2\\3\\4\\5|!"), []byte("#^xxx24\\22\\33|!#^"),
+			[]string{"23|2|3|4", "24|22|33|0"}, nil},
+		{[]byte("xxx24\\2\\3\\4\\5|!"), []byte("#^xxx25\\22\\33|!#^xxx26\\222|!#^"),
+			[]string{"24|2|3|4", "25|22|33|0", "26|222||0"}, nil},
+		{[]byte("xxx25\\2\\3\\4\\5|!"), []byte("#^26\\22\\33|!#^xxx27\\222|!#^"),
+			[]string{"25|2|3|4", "27|222||0"}, nil},
+		{[]byte("xxx\\2\\3"), []byte("4\\5|!#^"), []string{"28|2|34|5"}, nil},
 
 		// InsertData returns data isn't nil
 		{nil, []byte("\\2\\3\\4|!#^"), nil, []byte("#^")},
 		{nil, []byte("\\4\\5"), nil, []byte("\\5")},
 		{[]byte("\\2\\3"), []byte("\\4\\5"), nil, []byte("\\5")},
 		{[]byte("xxx1\\2\\3|"), []byte("!#^\\4\\5|!#"),
-			[]string{fmt.Sprintf("%v %v %v %v", 1, 2, []byte("3"), 0)}, []byte("!#")},
-		{[]byte("xxx1\\2\\3\\4\\5|!"), []byte("#^xxx2\\22\\33|!#^3\\222|!#^"), []string{
-			fmt.Sprintf("%v %v %v %v", 1, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 2, 22, []byte("33"), 0)}, []byte("#^")},
+			[]string{"1|2|3|0"}, []byte("!#")},
+		{[]byte("xxx1\\2\\3\\4\\5|!"), []byte("#^xxx2\\22\\33|!#^3\\222|!#^"),
+			[]string{"1|2|3|4", "2|22|33|0"}, []byte("#^")},
 		{[]byte("xx1\\2\\3"), []byte("\\4\\5|!#^"), nil, []byte("#^")},
 	}
-	checkCases(cases, ld, c, tk, ctx, selectSQL, deleteSQL)
+	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
 
 	// lines starting symbol is the same as terminated symbol, InsertData returns data is nil
 	ld.LinesInfo.Terminated = "xxx"
-	cases = []testCase{
+	tests = []testCase{
 		// data1 = nil, data2 != nil
-		{nil, []byte("xxxxxx"), []string{fmt.Sprintf("%v %v %v %v", 29, 0, []byte(""), 0)}, nil},
-		{nil, []byte("xxx3\\2\\3\\4xxx"), []string{fmt.Sprintf("%v %v %v %v", 3, 2, []byte("3"), 4)}, nil},
-		{nil, []byte("xxx\\2\\3\\4xxxxxx\\22\\33\\44xxx"), []string{
-			fmt.Sprintf("%v %v %v %v", 30, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 31, 22, []byte("33"), 44)}, nil},
+		{nil, []byte("xxxxxx"), []string{"29|0||0"}, nil},
+		{nil, []byte("xxx3\\2\\3\\4xxx"), []string{"3|2|3|4"}, nil},
+		{nil, []byte("xxx\\2\\3\\4xxxxxx\\22\\33\\44xxx"),
+			[]string{"30|2|3|4", "31|22|33|44"}, nil},
 
 		// data1 != nil, data2 = nil
-		{[]byte("xxx\\2\\3\\4"), nil, []string{fmt.Sprintf("%v %v %v %v", 32, 2, []byte("3"), 4)}, nil},
+		{[]byte("xxx\\2\\3\\4"), nil, []string{"32|2|3|4"}, nil},
 
 		// data1 != nil, data2 != nil
-		{[]byte("xxx10\\2\\3"), []byte("\\4\\5xxx"),
-			[]string{fmt.Sprintf("%v %v %v %v", 10, 2, []byte("3"), 4)}, nil},
-		{[]byte("xxxxx10\\2\\3"), []byte("\\4\\5xxx"),
-			[]string{fmt.Sprintf("%v %v %v %v", 33, 2, []byte("3"), 4)}, nil},
-		{[]byte("xxx21\\2\\3\\4\\5xx"), []byte("x"),
-			[]string{fmt.Sprintf("%v %v %v %v", 21, 2, []byte("3"), 4)}, nil},
-		{[]byte("xxx32\\2\\3\\4\\5x"), []byte("xxxxx33\\22\\33\\44\\55xxx"), []string{
-			fmt.Sprintf("%v %v %v %v", 32, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 33, 22, []byte("33"), 44)}, nil},
-		{[]byte("xxx33\\2\\3\\4\\5xxx"), []byte("xxx34\\22\\33xxx"), []string{
-			fmt.Sprintf("%v %v %v %v", 33, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 34, 22, []byte("33"), 0)}, nil},
-		{[]byte("xxx34\\2\\3\\4\\5xx"), []byte("xxxx35\\22\\33xxxxxx36\\222xxx"), []string{
-			fmt.Sprintf("%v %v %v %v", 34, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 35, 22, []byte("33"), 0),
-			fmt.Sprintf("%v %v %v %v", 36, 222, []byte(""), 0)}, nil},
+		{[]byte("xxx10\\2\\3"), []byte("\\4\\5xxx"), []string{"10|2|3|4"}, nil},
+		{[]byte("xxxxx10\\2\\3"), []byte("\\4\\5xxx"), []string{"33|2|3|4"}, nil},
+		{[]byte("xxx21\\2\\3\\4\\5xx"), []byte("x"), []string{"21|2|3|4"}, nil},
+		{[]byte("xxx32\\2\\3\\4\\5x"), []byte("xxxxx33\\22\\33\\44\\55xxx"),
+			[]string{"32|2|3|4", "33|22|33|44"}, nil},
+		{[]byte("xxx33\\2\\3\\4\\5xxx"), []byte("xxx34\\22\\33xxx"),
+			[]string{"33|2|3|4", "34|22|33|0"}, nil},
+		{[]byte("xxx34\\2\\3\\4\\5xx"), []byte("xxxx35\\22\\33xxxxxx36\\222xxx"),
+			[]string{"34|2|3|4", "35|22|33|0", "36|222||0"}, nil},
 
 		// InsertData returns data isn't nil
 		{nil, []byte("\\2\\3\\4xxxx"), nil, []byte("xxxx")},
-		{[]byte("\\2\\3\\4xxx"), nil,
-			[]string{fmt.Sprintf("%v %v %v %v", 37, 0, []byte(""), 0)}, nil},
-		{[]byte("\\2\\3\\4xxxxxx11\\22\\33\\44xxx"), nil, []string{
-			fmt.Sprintf("%v %v %v %v", 38, 0, []byte(""), 0),
-			fmt.Sprintf("%v %v %v %v", 39, 0, []byte(""), 0)}, nil},
+		{[]byte("\\2\\3\\4xxx"), nil, []string{"37|0||0"}, nil},
+		{[]byte("\\2\\3\\4xxxxxx11\\22\\33\\44xxx"), nil,
+			[]string{"38|0||0", "39|0||0"}, nil},
 		{[]byte("xx10\\2\\3"), []byte("\\4\\5xxx"), nil, []byte("xxx")},
-		{[]byte("xxx10\\2\\3"), []byte("\\4xxxx"),
-			[]string{fmt.Sprintf("%v %v %v %v", 10, 2, []byte("3"), 4)}, []byte("x")},
-		{[]byte("xxx10\\2\\3\\4\\5x"), []byte("xx11\\22\\33xxxxxx12\\222xxx"), []string{
-			fmt.Sprintf("%v %v %v %v", 10, 2, []byte("3"), 4),
-			fmt.Sprintf("%v %v %v %v", 40, 0, []byte(""), 0)}, []byte("xxx")},
+		{[]byte("xxx10\\2\\3"), []byte("\\4xxxx"), []string{"10|2|3|4"}, []byte("x")},
+		{[]byte("xxx10\\2\\3\\4\\5x"), []byte("xx11\\22\\33xxxxxx12\\222xxx"),
+			[]string{"10|2|3|4", "40|0||0"}, []byte("xxx")},
 	}
-	checkCases(cases, ld, c, tk, ctx, selectSQL, deleteSQL)
+	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
 }
 
 func (s *testSuite) TestLoadDataEscape(c *C) {
@@ -821,33 +790,126 @@ func (s *testSuite) TestLoadDataEscape(c *C) {
 	tk.MustExec("CREATE TABLE load_data_test (id INT NOT NULL PRIMARY KEY, value TEXT NOT NULL) CHARACTER SET utf8")
 	tk.MustExec("load data local infile '/tmp/nonexistence.csv' into table load_data_test")
 	ctx := tk.Se.(context.Context)
-	ld := makeLoadDataInfo(2, ctx, c)
+	ld := makeLoadDataInfo(2, nil, ctx, c)
 	// test escape
-	cases := []testCase{
+	tests := []testCase{
 		// data1 = nil, data2 != nil
-		{nil, []byte("1\ta string\n"), []string{fmt.Sprintf("%v %v", 1, []byte("a string"))}, nil},
-		{nil, []byte("2\tstr \\t\n"), []string{fmt.Sprintf("%v %v", 2, []byte("str \t"))}, nil},
-		{nil, []byte("3\tstr \\n\n"), []string{fmt.Sprintf("%v %v", 3, []byte("str \n"))}, nil},
-		{nil, []byte("4\tboth \\t\\n\n"), []string{fmt.Sprintf("%v %v", 4, []byte("both \t\n"))}, nil},
-		{nil, []byte("5\tstr \\\\\n"), []string{fmt.Sprintf("%v %v", 5, []byte("str \\"))}, nil},
-		{nil, []byte("6\t\\r\\t\\n\\0\\Z\\b\n"), []string{fmt.Sprintf("%v %v", 6, []byte{'\r', '\t', '\n', 0, 26, '\b'})}, nil},
+		{nil, []byte("1\ta string\n"), []string{"1|a string"}, nil},
+		{nil, []byte("2\tstr \\t\n"), []string{"2|str \t"}, nil},
+		{nil, []byte("3\tstr \\n\n"), []string{"3|str \n"}, nil},
+		{nil, []byte("4\tboth \\t\\n\n"), []string{"4|both \t\n"}, nil},
+		{nil, []byte("5\tstr \\\\\n"), []string{"5|str \\"}, nil},
+		{nil, []byte("6\t\\r\\t\\n\\0\\Z\\b\n"), []string{"6|" + string([]byte{'\r', '\t', '\n', 0, 26, '\b'})}, nil},
 	}
 	deleteSQL := "delete from load_data_test"
 	selectSQL := "select * from load_data_test;"
-	checkCases(cases, ld, c, tk, ctx, selectSQL, deleteSQL)
+	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
 }
 
-func makeLoadDataInfo(column int, ctx context.Context, c *C) (ld *executor.LoadDataInfo) {
+// reuse TestLoadDataEscape's test case :-)
+func (s *testSuite) TestLoadDataSpecifiedCoumns(c *C) {
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+	}()
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test; drop table if exists load_data_test;")
+	tk.MustExec(`create table load_data_test (id int PRIMARY KEY AUTO_INCREMENT, c1 int, c2 varchar(255) default "def", c3 int default 0);`)
+	tk.MustExec("load data local infile '/tmp/nonexistence.csv' into table load_data_test (c1, c2)")
+	ctx := tk.Se.(context.Context)
+	ld := makeLoadDataInfo(2, []string{"c1", "c2"}, ctx, c)
+	// test
+	tests := []testCase{
+		// data1 = nil, data2 != nil
+		{nil, []byte("7\ta string\n"), []string{"1|7|a string|0"}, nil},
+		{nil, []byte("8\tstr \\t\n"), []string{"2|8|str \t|0"}, nil},
+		{nil, []byte("9\tstr \\n\n"), []string{"3|9|str \n|0"}, nil},
+		{nil, []byte("10\tboth \\t\\n\n"), []string{"4|10|both \t\n|0"}, nil},
+		{nil, []byte("11\tstr \\\\\n"), []string{"5|11|str \\|0"}, nil},
+		{nil, []byte("12\t\\r\\t\\n\\0\\Z\\b\n"), []string{"6|12|" + string([]byte{'\r', '\t', '\n', 0, 26, '\b'}) + "|0"}, nil},
+	}
+	deleteSQL := "delete from load_data_test"
+	selectSQL := "select * from load_data_test;"
+	checkCases(tests, ld, c, tk, ctx, selectSQL, deleteSQL)
+}
+
+func makeLoadDataInfo(column int, specifiedColumns []string, ctx context.Context, c *C) (ld *executor.LoadDataInfo) {
 	domain := sessionctx.GetDomain(ctx)
 	is := domain.InfoSchema()
 	c.Assert(is, NotNil)
 	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("load_data_test"))
 	c.Assert(err, IsNil)
+	columns := tbl.Cols()
+	// filter specified columns
+	if len(specifiedColumns) > 0 {
+		columns, err = table.FindCols(columns, specifiedColumns)
+		c.Assert(err, IsNil)
+	}
 	fields := &ast.FieldsClause{Terminated: "\t"}
 	lines := &ast.LinesClause{Starting: "", Terminated: "\n"}
-	ld = executor.NewLoadDataInfo(make([]types.Datum, column), ctx, tbl)
+	ld = executor.NewLoadDataInfo(make([]types.Datum, column), ctx, tbl, columns)
 	ld.SetBatchCount(0)
 	ld.FieldsInfo = fields
 	ld.LinesInfo = lines
 	return
+}
+
+func (s *testSuite) TestBatchInsert(c *C) {
+	originLimit := atomic.LoadUint64(&kv.TxnEntryCountLimit)
+	originBatch := executor.BatchInsertSize
+	defer func() {
+		s.cleanEnv(c)
+		testleak.AfterTest(c)()
+		atomic.StoreUint64(&kv.TxnEntryCountLimit, originLimit)
+		executor.BatchInsertSize = originBatch
+	}()
+	// Set the limitation to a small value, make it easier to reach the limitation.
+	atomic.StoreUint64(&kv.TxnEntryCountLimit, 100)
+	executor.BatchInsertSize = 50
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists batch_insert")
+	tk.MustExec("create table batch_insert (c int)")
+	// Insert 10 rows.
+	tk.MustExec("insert into batch_insert values (1),(1),(1),(1),(1),(1),(1),(1),(1),(1)")
+	r := tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("10"))
+	// Insert 10 rows.
+	tk.MustExec("insert into batch_insert (c) select * from batch_insert;")
+	r = tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("20"))
+	// Insert 20 rows.
+	tk.MustExec("insert into batch_insert (c) select * from batch_insert;")
+	r = tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("40"))
+	// Insert 40 rows.
+	tk.MustExec("insert into batch_insert (c) select * from batch_insert;")
+	r = tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("80"))
+	// Insert 80 rows.
+	tk.MustExec("insert into batch_insert (c) select * from batch_insert;")
+	r = tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("160"))
+
+	// This will meet txn too large error.
+	_, err := tk.Exec("insert into batch_insert (c) select * from batch_insert;")
+	c.Assert(err, NotNil)
+	c.Assert(kv.ErrTxnTooLarge.Equal(err), IsTrue)
+	r = tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("160"))
+
+	// Change to batch inset mode.
+	tk.MustExec("set @@session.tidb_batch_insert=1;")
+	tk.MustExec("insert into batch_insert (c) select * from batch_insert;")
+	r = tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("320"))
+
+	// Disable BachInsert mode in transition.
+	tk.MustExec("begin;")
+	_, err = tk.Exec("insert into batch_insert (c) select * from batch_insert;")
+	c.Assert(err, NotNil)
+	c.Assert(kv.ErrTxnTooLarge.Equal(err), IsTrue)
+	tk.MustExec("rollback;")
+	r = tk.MustQuery("select count(*) from batch_insert;")
+	r.Check(testkit.Rows("320"))
 }

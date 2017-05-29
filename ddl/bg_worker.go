@@ -56,9 +56,11 @@ func (d *ddl) handleBgJobQueue() error {
 			return errors.Trace(err)
 		}
 
+		if ChangeOwnerInNewWay {
+			return nil
+		}
 		owner.LastUpdateTS = time.Now().UnixNano()
 		err = t.SetBgJobOwner(owner)
-
 		return errors.Trace(err)
 	})
 	if err != nil {
@@ -131,7 +133,7 @@ func (d *ddl) updateBgJob(t *meta.Meta, job *model.Job) error {
 	return errors.Trace(err)
 }
 
-// finishBgJob finishs a background job.
+// finishBgJob finishes a background job.
 func (d *ddl) finishBgJob(t *meta.Meta, job *model.Job) error {
 	log.Infof("[ddl] finish background job %v", job)
 	if _, err := t.DeQueueBgJob(); err != nil {

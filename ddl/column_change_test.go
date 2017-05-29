@@ -30,6 +30,7 @@ import (
 	"github.com/pingcap/tidb/util/testleak"
 	"github.com/pingcap/tidb/util/testutil"
 	"github.com/pingcap/tidb/util/types"
+	goctx "golang.org/x/net/context"
 )
 
 var _ = Suite(&testColumnChangeSuite{})
@@ -54,7 +55,7 @@ func (s *testColumnChangeSuite) SetUpSuite(c *C) {
 
 func (s *testColumnChangeSuite) TestColumnChange(c *C) {
 	defer testleak.AfterTest(c)()
-	d := newDDL(s.store, nil, nil, testLease)
+	d := newDDL(goctx.Background(), nil, s.store, nil, nil, testLease)
 	defer d.Stop()
 	// create table t (c1 int, c2 int);
 	tblInfo := testTableInfo(c, d, "t", 2)
@@ -177,7 +178,7 @@ func (s *testColumnChangeSuite) testAddColumnNoDefault(c *C, ctx context.Context
 		}
 	}
 	d.setHook(tc)
-	d.start()
+	d.start(goctx.Background())
 	job := testCreateColumn(c, ctx, d, s.dbInfo, tblInfo, "c3", &ast.ColumnPosition{Tp: ast.ColumnPositionNone}, nil)
 	c.Assert(errors.ErrorStack(checkErr), Equals, "")
 	testCheckJobDone(c, d, job, true)
@@ -206,7 +207,7 @@ func (s *testColumnChangeSuite) testColumnDrop(c *C, ctx context.Context, d *ddl
 		}
 	}
 	d.setHook(tc)
-	d.start()
+	d.start(goctx.Background())
 	c.Assert(errors.ErrorStack(checkErr), Equals, "")
 	testDropColumn(c, ctx, d, s.dbInfo, tbl.Meta(), dropCol.Name.L, false)
 }
@@ -225,7 +226,8 @@ func (s *testColumnChangeSuite) checkAddWriteOnly(d *ddl, ctx context.Context, d
 	if err != nil {
 		return errors.Trace(err)
 	}
-	err = checkResult(ctx, writeOnlyTable, testutil.RowsWithSep(" ", "1 2 <nil>", "2 3 3"))
+	err = checkResult(ctx, writeOnlyTable, writeOnlyTable.WritableCols(),
+		testutil.RowsWithSep(" ", "1 2 <nil>", "2 3 3"))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -240,7 +242,7 @@ func (s *testColumnChangeSuite) checkAddWriteOnly(d *ddl, ctx context.Context, d
 		return errors.Errorf("expect %v, got %v", expect, got)
 	}
 	// DeleteOnlyTable: select * from t
-	err = checkResult(ctx, deleteOnlyTable, testutil.RowsWithSep(" ", "1 2", "2 3"))
+	err = checkResult(ctx, deleteOnlyTable, deleteOnlyTable.WritableCols(), testutil.RowsWithSep(" ", "1 2", "2 3"))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -258,7 +260,7 @@ func (s *testColumnChangeSuite) checkAddWriteOnly(d *ddl, ctx context.Context, d
 		return errors.Trace(err)
 	}
 	// After we update the first row, its default value is also set.
-	err = checkResult(ctx, writeOnlyTable, testutil.RowsWithSep(" ", "2 2 3", "2 3 3"))
+	err = checkResult(ctx, writeOnlyTable, writeOnlyTable.WritableCols(), testutil.RowsWithSep(" ", "2 2 3", "2 3 3"))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -272,7 +274,7 @@ func (s *testColumnChangeSuite) checkAddWriteOnly(d *ddl, ctx context.Context, d
 		return errors.Trace(err)
 	}
 	// After delete table has deleted the first row, check the WriteOnly table records.
-	err = checkResult(ctx, writeOnlyTable, testutil.RowsWithSep(" ", "2 3 3"))
+	err = checkResult(ctx, writeOnlyTable, writeOnlyTable.WritableCols(), testutil.RowsWithSep(" ", "2 3 3"))
 	return errors.Trace(err)
 }
 
@@ -316,7 +318,7 @@ func (s *testColumnChangeSuite) checkAddPublic(d *ddl, ctx context.Context, writ
 		return errors.Trace(err)
 	}
 	// publicTable select * from t, make sure the new c3 value 4 is not overwritten to default value 3.
-	err = checkResult(ctx, publicTable, testutil.RowsWithSep(" ", "2 3 3", "3 4 4"))
+	err = checkResult(ctx, publicTable, publicTable.WritableCols(), testutil.RowsWithSep(" ", "2 3 3", "3 4 4"))
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -345,9 +347,9 @@ func getCurrentTable(d *ddl, schemaID, tableID int64) (table.Table, error) {
 	return tbl, err
 }
 
-func checkResult(ctx context.Context, t table.Table, rows [][]interface{}) error {
+func checkResult(ctx context.Context, t table.Table, cols []*table.Column, rows [][]interface{}) error {
 	var gotRows [][]interface{}
-	t.IterRecords(ctx, t.FirstKey(), t.WritableCols(), func(h int64, data []types.Datum, cols []*table.Column) (bool, error) {
+	t.IterRecords(ctx, t.FirstKey(), cols, func(h int64, data []types.Datum, cols []*table.Column) (bool, error) {
 		gotRows = append(gotRows, datumsToInterfaces(data))
 		return true, nil
 	})

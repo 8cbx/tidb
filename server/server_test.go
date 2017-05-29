@@ -23,11 +23,14 @@ import (
 	"regexp"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/executor"
 	tmysql "github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/util/printer"
 )
 
@@ -247,7 +250,9 @@ func runTestLoadData(c *C) {
 		c.Assert(err, IsNil)
 		err = os.Remove(path)
 		c.Assert(err, IsNil)
+		variable.GoSQLDriverTest = false
 	}()
+	variable.GoSQLDriverTest = true
 	_, err = fp.WriteString(`
 xxx row1_col1	- row1_col2	1abc
 xxx row2_col1	- row2_col2	
@@ -462,6 +467,7 @@ func checkErrorCode(c *C, e error, code uint16) {
 func runTestAuth(c *C) {
 	runTests(c, dsn, func(dbt *DBTest) {
 		dbt.mustExec(`CREATE USER 'test'@'%' IDENTIFIED BY '123';`)
+		dbt.mustExec(`FLUSH PRIVILEGES;`)
 	})
 	newDsn := "test:123@tcp(localhost:4001)/test?strict=true"
 	runTests(c, newDsn, func(dbt *DBTest) {
@@ -476,6 +482,7 @@ func runTestAuth(c *C) {
 	// Test login use IP that not exists in mysql.user.
 	runTests(c, dsn, func(dbt *DBTest) {
 		dbt.mustExec(`CREATE USER 'xxx'@'localhost' IDENTIFIED BY 'yyy';`)
+		dbt.mustExec(`FLUSH PRIVILEGES;`)
 	})
 	newDsn = "xxx:yyy@tcp(127.0.0.1:4001)/test?strict=true"
 	runTests(c, newDsn, func(dbt *DBTest) {
@@ -600,4 +607,36 @@ func getStmtCnt(content string) (stmtCnt map[string]int) {
 		stmtCnt[v[1]] = cnt
 	}
 	return stmtCnt
+}
+
+const retryTime = 100
+
+func waitUntilServerOnline(statusAddr string) {
+	// connect server
+	retry := 0
+	for ; retry < retryTime; retry++ {
+		time.Sleep(time.Millisecond * 10)
+		db, err := sql.Open("mysql", dsn)
+		if err == nil {
+			db.Close()
+			break
+		}
+	}
+	if retry == retryTime {
+		log.Fatalf("Failed to connect db for %d retries in every 10 ms", retryTime)
+	}
+	// connect http status
+	statusURL := fmt.Sprintf("http://127.0.0.1%s/status", statusAddr)
+	for retry = 0; retry < retryTime; retry++ {
+		resp, err := http.Get(statusURL)
+		if err == nil {
+			ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(time.Millisecond * 10)
+	}
+	if retry == retryTime {
+		log.Fatalf("Failed to connect http status for %d retries in every 10 ms", retryTime)
+	}
 }

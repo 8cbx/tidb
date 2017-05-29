@@ -22,11 +22,13 @@ import (
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb/context"
 	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
 	"github.com/pingcap/tidb/plan"
+	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/localstore"
 	"github.com/pingcap/tidb/table/tables"
@@ -276,12 +278,31 @@ func (s *testSessionSuite) TestAutoIncrementID(c *C) {
 	c.Assert(lastID, Less, uint64(4))
 	mustExecSQL(c, se, "insert t () values ()")
 	c.Assert(se.LastInsertID(), Greater, lastID)
-	mustExecSQL(c, se, "insert t () select 100")
+	lastID = se.LastInsertID()
+	mustExecSQL(c, se, "insert t values (100)")
+	c.Assert(se.LastInsertID(), Equals, uint64(100))
+
+	// If the auto_increment column value is given, it uses the value of the latest row.
+	mustExecSQL(c, se, "insert t values (120), (112)")
+	c.Assert(se.LastInsertID(), Equals, uint64(112))
+
+	// The last_insert_id function only use last auto-generated id.
+	mustExecMatch(c, se, "select last_insert_id()", [][]interface{}{{lastID}})
 
 	mustExecSQL(c, se, "drop table if exists t")
 	mustExecSQL(c, se, "create table t (i tinyint unsigned not null auto_increment, primary key (i));")
 	mustExecSQL(c, se, "insert into t set i = 254;")
 	mustExecSQL(c, se, "insert t values ()")
+
+	// The last insert ID doesn't care about primary key, it is set even if its a normal index column.
+	mustExecSQL(c, se, "create table autoid (id int auto_increment, index (id))")
+	mustExecSQL(c, se, "insert autoid values ()")
+	c.Assert(se.LastInsertID(), Greater, uint64(0))
+	mustExecSQL(c, se, "insert autoid values (100)")
+	c.Assert(se.LastInsertID(), Equals, uint64(100))
+
+	mustExecMatch(c, se, "select last_insert_id(20)", [][]interface{}{{20}})
+	mustExecMatch(c, se, "select last_insert_id()", [][]interface{}{{20}})
 
 	mustExecSQL(c, se, dropDBSQL)
 }
@@ -520,11 +541,11 @@ func (s *testSessionSuite) TestIssue827(c *C) {
 	r, err := GetRows(rs)
 	c.Assert(err, IsNil)
 	c.Assert(r, DeepEquals, expect)
-	currLastInsertID := se.LastInsertID()
+	currLastInsertID := se.GetSessionVars().PrevLastInsertID
 	c.Assert(lastInsertID+5, Equals, currLastInsertID)
 
 	// insert set
-	lastInsertID = se.LastInsertID()
+	lastInsertID = currLastInsertID
 	mustExecSQL(c, se, "begin")
 	mustExecSQL(c, se, "insert into t set c2 = 31")
 	rs, err = exec(se, "select c1 from t where c2 = 31")
@@ -546,11 +567,11 @@ func (s *testSessionSuite) TestIssue827(c *C) {
 	r, err = GetRows(rs)
 	c.Assert(err, IsNil)
 	c.Assert(r, DeepEquals, expect)
-	currLastInsertID = se.LastInsertID()
+	currLastInsertID = se.GetSessionVars().PrevLastInsertID
 	c.Assert(lastInsertID+3, Equals, currLastInsertID)
 
 	// replace
-	lastInsertID = se.LastInsertID()
+	lastInsertID = currLastInsertID
 	mustExecSQL(c, se, "begin")
 	mustExecSQL(c, se, "insert into t (c2) values (21), (22), (23)")
 	rs, err = exec(se, "select c1 from t where c2 = 21")
@@ -572,11 +593,11 @@ func (s *testSessionSuite) TestIssue827(c *C) {
 	r, err = GetRows(rs)
 	c.Assert(err, IsNil)
 	c.Assert(r, DeepEquals, expect)
-	currLastInsertID = se.LastInsertID()
+	currLastInsertID = se.GetSessionVars().PrevLastInsertID
 	c.Assert(lastInsertID+1, Equals, currLastInsertID)
 
 	// update
-	lastInsertID = se.LastInsertID()
+	lastInsertID = currLastInsertID
 	mustExecSQL(c, se, "begin")
 	mustExecSQL(c, se, "insert into t set c2 = 41")
 	mustExecSQL(c, se, "update t set c1 = 0 where c2 = 41")
@@ -599,11 +620,11 @@ func (s *testSessionSuite) TestIssue827(c *C) {
 	r, err = GetRows(rs)
 	c.Assert(err, IsNil)
 	c.Assert(r, DeepEquals, expect)
-	currLastInsertID = se.LastInsertID()
+	currLastInsertID = se.GetSessionVars().PrevLastInsertID
 	c.Assert(lastInsertID+3, Equals, currLastInsertID)
 
 	// prepare
-	lastInsertID = se.LastInsertID()
+	lastInsertID = currLastInsertID
 	mustExecSQL(c, se, "begin")
 	mustExecSQL(c, se, "prepare stmt from 'insert into t (c2) values (?)'")
 	mustExecSQL(c, se, "set @v1=100")
@@ -632,14 +653,12 @@ func (s *testSessionSuite) TestIssue827(c *C) {
 	r, err = GetRows(rs)
 	c.Assert(err, IsNil)
 	c.Assert(r, DeepEquals, expect)
-	currLastInsertID = se.LastInsertID()
+	currLastInsertID = se.GetSessionVars().PrevLastInsertID
 	c.Assert(lastInsertID+3, Equals, currLastInsertID)
 
 	mustExecSQL(c, se, dropDBSQL)
-	err = se.Close()
-	c.Assert(err, IsNil)
-	err = se1.Close()
-	c.Assert(err, IsNil)
+	se.Close()
+	se1.Close()
 }
 
 func (s *testSessionSuite) TestIssue996(c *C) {
@@ -666,7 +685,7 @@ func (s *testSessionSuite) TestIssue996(c *C) {
 	r, err := GetRows(rs)
 	c.Assert(err, IsNil)
 	c.Assert(r, NotNil)
-	currLastInsertID := se.LastInsertID()
+	currLastInsertID := se.GetSessionVars().PrevLastInsertID
 	c.Assert(r[0][0].GetValue(), DeepEquals, int64(currLastInsertID))
 	c.Assert(lastInsertID+2, Equals, currLastInsertID)
 
@@ -850,7 +869,7 @@ func (s *testSessionSuite) TestSelectForUpdate(c *C) {
 
 	_, err = exec(se1, "commit")
 	c.Assert(err, NotNil)
-	err = se1.(*session).retry(10)
+	err = se1.(*session).retry(10, false)
 	// retry should fail
 	c.Assert(err, NotNil)
 
@@ -891,12 +910,9 @@ func (s *testSessionSuite) TestSelectForUpdate(c *C) {
 	c.Assert(err, IsNil)
 
 	mustExecSQL(c, se, dropDBSQL)
-	err = se.Close()
-	c.Assert(err, IsNil)
-	err = se1.Close()
-	c.Assert(err, IsNil)
-	err = se2.Close()
-	c.Assert(err, IsNil)
+	se.Close()
+	se1.Close()
+	se2.Close()
 }
 
 func (s *testSessionSuite) TestRow(c *C) {
@@ -1729,7 +1745,7 @@ func (s *testSessionSuite) TestFieldText(c *C) {
 	se := newSession(c, s.store, dbName)
 	mustExecSQL(c, se, "drop table if exists t")
 	mustExecSQL(c, se, "create table t (a int)")
-	cases := []struct {
+	tests := []struct {
 		sql   string
 		field string
 	}{
@@ -1739,13 +1755,13 @@ func (s *testSessionSuite) TestFieldText(c *C) {
 		{"select a from t", "a"},
 		{"select        ((a+1))     from t", "((a+1))"},
 	}
-	for _, v := range cases {
-		results, err := se.Execute(v.sql)
+	for _, tt := range tests {
+		results, err := se.Execute(tt.sql)
 		c.Assert(err, IsNil)
 		result := results[0]
 		fields, err := result.Fields()
 		c.Assert(err, IsNil)
-		c.Assert(fields[0].ColumnAsName.O, Equals, v.field)
+		c.Assert(fields[0].ColumnAsName.O, Equals, tt.field)
 	}
 
 	mustExecSQL(c, se, dropDBSQL)
@@ -2043,12 +2059,9 @@ func (s *test1435Suite) TestIssue1435(c *C) {
 	err = <-endCh2
 	c.Assert(err, IsNil, Commentf("err:%v", err))
 
-	err = se.Close()
-	c.Assert(err, IsNil)
-	err = se1.Close()
-	c.Assert(err, IsNil)
-	err = se2.Close()
-	c.Assert(err, IsNil)
+	se.Close()
+	se1.Close()
+	se2.Close()
 	sessionctx.GetDomain(ctx).Close()
 	err = store.Close()
 	c.Assert(err, IsNil)
@@ -2063,9 +2076,8 @@ func (s *testSessionSuite) TestSession(c *C) {
 	se := newSession(c, s.store, dbName)
 	mustExecSQL(c, se, "ROLLBACK;")
 
-	err := se.Close()
-	c.Assert(err, IsNil)
 	mustExecSQL(c, se, dropDBSQL)
+	se.Close()
 }
 
 func (s *testSessionSuite) TestSessionAuth(c *C) {
@@ -2076,6 +2088,29 @@ func (s *testSessionSuite) TestSessionAuth(c *C) {
 	defer se.Close()
 	c.Assert(se.Auth("Any not exist username with zero password! @anyhost", []byte(""), []byte("")), IsFalse)
 
+	mustExecSQL(c, se, dropDBSQL)
+}
+
+func (s *testSessionSuite) TestSkipWithGrant(c *C) {
+	defer testleak.AfterTest(c)()
+	dbName := "test_skip_with_grant"
+	se := newSession(c, s.store, dbName)
+	dropDBSQL := fmt.Sprintf("drop database %s;", dbName)
+
+	save1 := privileges.Enable
+	save2 := privileges.SkipWithGrant
+
+	privileges.Enable = true
+	privileges.SkipWithGrant = false
+	c.Assert(se.Auth("user_not_exist", []byte("yyy"), []byte("zzz")), IsFalse)
+
+	privileges.SkipWithGrant = true
+	c.Assert(se.Auth(`xxx@%`, []byte("yyy"), []byte("zzz")), IsTrue)
+	c.Assert(se.Auth(`root@%`, []byte(""), []byte("")), IsTrue)
+	mustExecSQL(c, se, "create table t (id int)")
+
+	privileges.Enable = save1
+	privileges.SkipWithGrant = save2
 	mustExecSQL(c, se, dropDBSQL)
 }
 
@@ -2167,9 +2202,8 @@ func (s *testSessionSuite) TestMultiColumnIndex(c *C) {
 	sql = "select c1, c2 from t where c1 = 'abc' and id < 2"
 	mustExecMatch(c, se, sql, [][]interface{}{{[]byte("abc"), []byte("def")}})
 
-	err := se.Close()
-	c.Assert(err, IsNil)
 	mustExecSQL(c, se, dropDBSQL)
+	se.Close()
 }
 
 func (s *testSessionSuite) TestSubstringIndexExpr(c *C) {
@@ -2376,9 +2410,8 @@ func (s *testSessionSuite) TestSpecifyIndexPrefixLength(c *C) {
 	mustExecMatch(c, se, "select c from t where a < 'bbcc' and b = 'abcd';", [][]interface{}{{1}, {4}})
 	mustExecMatch(c, se, "select c from t where a > 'bbcf';", [][]interface{}{{5}, {6}})
 
-	err = se.Close()
-	c.Assert(err, IsNil)
 	mustExecSQL(c, se, dropDBSQL)
+	se.Close()
 }
 
 func (s *testSessionSuite) TestIndexColumnLength(c *C) {
@@ -2581,8 +2614,8 @@ func (s *testSessionSuite) TestXAggregateWithoutAggFunc(c *C) {
 func (s *testSessionSuite) TestSelectHaving(c *C) {
 	defer testleak.AfterTest(c)()
 	table := "select_having_test"
-	initSQL := fmt.Sprintf(`use test; 
-		drop table if exists %s; 
+	initSQL := fmt.Sprintf(`use test;
+		drop table if exists %s;
 		create table %s(id int not null default 1, name varchar(255), PRIMARY KEY(id));
 		insert INTO %s VALUES (1, "hello");
 		insert into %s VALUES (2, "hello");`,
@@ -2630,7 +2663,7 @@ func (s *testSessionSuite) TestTruncateAlloc(c *C) {
 	mustExecSQL(c, se, dropDBSQL)
 }
 
-// Test infomation_schema.columns.
+// Test information_schema.columns.
 func (s *testSessionSuite) TestISColumns(c *C) {
 	defer testleak.AfterTest(c)()
 	dbName := "test_is_columns"
@@ -2667,4 +2700,67 @@ func (s *testSessionSuite) TestRetryCleanTxn(c *C) {
 	c.Assert(err, NotNil)
 	c.Assert(se.Txn(), IsNil)
 	c.Assert(se.sessionVars.InTxn(), IsFalse)
+}
+
+func (s *testSessionSuite) TestRetryResetStmtCtx(c *C) {
+	defer testleak.AfterTest(c)()
+	dbName := "test_retry_reset_stmtctx"
+	se := newSession(c, s.store, dbName).(*session)
+	se.Execute("create table retrytxn (a int unique, b int)")
+	_, err := se.Execute("insert retrytxn values (1, 1)")
+	c.Assert(err, IsNil)
+	se.Execute("begin")
+	se.Execute("update retrytxn set b = b + 1 where a = 1")
+
+	// Make retryable error.
+	se2 := newSession(c, s.store, dbName)
+	se2.Execute("update retrytxn set b = b + 1 where a = 1")
+
+	err = se.CommitTxn()
+	c.Assert(err, IsNil)
+	c.Assert(se.AffectedRows(), Equals, uint64(1))
+}
+
+func (s *testSessionSuite) TestCommitWhenSchemaChanged(c *C) {
+	c.Skip("skip localstore when lease is 0")
+	defer testleak.AfterTest(c)()
+	dbName := "test_commit_when_schema_changed"
+	s1 := newSession(c, s.store, dbName)
+	mustExecSQL(c, s1, "create table t (a int, b int)")
+
+	s2 := newSession(c, s.store, dbName)
+	mustExecSQL(c, s2, "begin")
+	mustExecSQL(c, s2, "insert into t values (1, 1)")
+
+	mustExecSQL(c, s1, "alter table t drop column b")
+
+	// When s2 commit, it will find schema already changed.
+	mustExecSQL(c, s2, "insert into t values (4, 4)")
+	_, err := s2.Execute("commit")
+	c.Assert(terror.ErrorEqual(err, executor.ErrWrongValueCountOnRow), IsTrue)
+}
+
+func (s *testSessionSuite) TestPrepareStmtCommitWhenSchemaChanged(c *C) {
+	defer testleak.AfterTest(c)()
+	dbName := "test_prepare_commit_when_schema_changed"
+	s1 := newSession(c, s.store, dbName)
+	mustExecSQL(c, s1, "create table t (a int, b int)")
+
+	s2 := newSession(c, s.store, dbName)
+	mustExecSQL(c, s2, "prepare stmt from 'insert into t values (?, ?)'")
+	mustExecSQL(c, s2, "set @a = 1")
+
+	// Commit find unrelated schema change.
+	mustExecSQL(c, s2, "begin")
+	mustExecSQL(c, s1, "create table t1 (id int)")
+	mustExecSQL(c, s2, "execute stmt using @a, @a")
+	_, err := s2.Execute("commit")
+	c.Assert(err, IsNil)
+
+	// TODO: PrepareStmt should handle this.
+	// mustExecSQL(c, s2, "begin")
+	// mustExecSQL(c, s1, "alter table t drop column b")
+	// mustExecSQL(c, s2, "execute stmt using @a, @a")
+	// _, err = s2.Execute("commit")
+	// c.Assert(terror.ErrorEqual(err, executor.ErrWrongValueCountOnRow), IsTrue)
 }

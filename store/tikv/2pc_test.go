@@ -14,7 +14,7 @@
 package tikv
 
 import (
-	goctx "context"
+	"math"
 	"math/rand"
 	"strings"
 	"time"
@@ -24,6 +24,8 @@ import (
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/tidb/store/tikv/mock-tikv"
+	"github.com/pingcap/tidb/terror"
+	goctx "golang.org/x/net/context"
 )
 
 type testCommitterSuite struct {
@@ -144,7 +146,7 @@ func (s *testCommitterSuite) TestPrewriteRollback(c *C) {
 		err = committer.prewriteKeys(NewBackoffer(prewriteMaxBackoff, ctx), committer.keys)
 		c.Assert(err, IsNil)
 	}
-	committer.commitTS, err = s.store.oracle.GetTimestamp()
+	committer.commitTS, err = s.store.oracle.GetTimestamp(ctx)
 	c.Assert(err, IsNil)
 	err = committer.commitKeys(NewBackoffer(commitMaxBackoff, ctx), [][]byte{[]byte("a")})
 	c.Assert(err, IsNil)
@@ -165,9 +167,9 @@ func (s *testCommitterSuite) TestContextCancel(c *C) {
 	c.Assert(err, IsNil)
 
 	bo := NewBackoffer(prewriteMaxBackoff, goctx.Background())
-	cancel := bo.WithCancel()
+	backoffer, cancel := bo.Fork()
 	cancel() // cancel the context
-	err = committer.prewriteKeys(bo, committer.keys)
+	err = committer.prewriteKeys(backoffer, committer.keys)
 	c.Assert(errors.Cause(err), Equals, goctx.Canceled)
 }
 
@@ -285,4 +287,134 @@ func (c *slowClient) SendCopReq(ctx goctx.Context, addr string, req *coprocessor
 		}
 	}
 	return c.Client.SendCopReq(ctx, addr, req, timeout)
+}
+
+func (s *testCommitterSuite) TestIllegalTso(c *C) {
+	txn := s.begin(c)
+	data := map[string]string{
+		"name": "aa",
+		"age":  "12",
+	}
+	for k, v := range data {
+		err := txn.Set([]byte(k), []byte(v))
+		c.Assert(err, IsNil)
+	}
+	// make start ts bigger.
+	txn.startTS = uint64(math.MaxUint64)
+	err := txn.Commit()
+	c.Assert(err, NotNil)
+}
+
+func errMsgMustContain(c *C, err error, msg string) {
+	c.Assert(strings.Contains(err.Error(), msg), IsTrue)
+}
+
+func (s *testCommitterSuite) TestCommitBeforePrewrite(c *C) {
+	txn := s.begin(c)
+	err := txn.Set([]byte("a"), []byte("a1"))
+	c.Assert(err, IsNil)
+	commiter, err := newTwoPhaseCommitter(txn)
+	ctx := goctx.Background()
+	err = commiter.cleanupKeys(NewBackoffer(cleanupMaxBackoff, ctx), commiter.keys)
+	c.Assert(err, IsNil)
+	err = commiter.prewriteKeys(NewBackoffer(prewriteMaxBackoff, ctx), commiter.keys)
+	c.Assert(err, NotNil)
+	errMsgMustContain(c, err, "write conflict")
+}
+
+func (s *testCommitterSuite) TestPrewritePrimaryKeyFailed(c *C) {
+	// commit (a,a1)
+	txn1 := s.begin(c)
+	err := txn1.Set([]byte("a"), []byte("a1"))
+	c.Assert(err, IsNil)
+	err = txn1.Commit()
+	c.Assert(err, IsNil)
+
+	// check a
+	txn := s.begin(c)
+	v, err := txn.Get([]byte("a"))
+	c.Assert(err, IsNil)
+	c.Assert(v, BytesEquals, []byte("a1"))
+
+	// set txn2's startTs before txn1's
+	txn2 := s.begin(c)
+	txn2.startTS = txn1.startTS - 1
+	err = txn2.Set([]byte("a"), []byte("a2"))
+	c.Assert(err, IsNil)
+	err = txn2.Set([]byte("b"), []byte("b2"))
+	c.Assert(err, IsNil)
+	// prewrite:primary a failed, b success
+	err = txn2.Commit()
+	c.Assert(err, NotNil)
+
+	// txn2 failed with a rollback for record a.
+	txn = s.begin(c)
+	v, err = txn.Get([]byte("a"))
+	c.Assert(err, IsNil)
+	c.Assert(v, BytesEquals, []byte("a1"))
+	v, err = txn.Get([]byte("b"))
+	errMsgMustContain(c, err, "key not exist")
+
+	// clean again, shouldn't be failed when a rollback already exist.
+	ctx := goctx.Background()
+	commiter, err := newTwoPhaseCommitter(txn2)
+	err = commiter.cleanupKeys(NewBackoffer(cleanupMaxBackoff, ctx), commiter.keys)
+	c.Assert(err, IsNil)
+
+	// check the data after rollback twice.
+	txn = s.begin(c)
+	v, err = txn.Get([]byte("a"))
+	c.Assert(err, IsNil)
+	c.Assert(v, BytesEquals, []byte("a1"))
+
+	// update data in a new txn, should be success.
+	err = txn.Set([]byte("a"), []byte("a3"))
+	c.Assert(err, IsNil)
+	err = txn.Commit()
+	c.Assert(err, IsNil)
+	// check value
+	txn = s.begin(c)
+	v, err = txn.Get([]byte("a"))
+	c.Assert(err, IsNil)
+	c.Assert(v, BytesEquals, []byte("a3"))
+}
+
+// timeoutKVClient wraps rpcClient and returns timeout error for
+// the specified kv commands.
+type timeoutKVClient struct {
+	Client
+	kvTimeouts map[kvrpcpb.MessageType]bool
+}
+
+type sendKVResult struct {
+	resp *kvrpcpb.Response
+	err  error
+}
+
+func (c *timeoutKVClient) SendKVReq(ctx goctx.Context, addr string, req *kvrpcpb.Request, timeout time.Duration) (*kvrpcpb.Response, error) {
+	if _, ok := c.kvTimeouts[req.GetType()]; ok {
+		return nil, errors.Errorf("timeout when send kv req %v", req.GetType())
+	}
+	return c.Client.SendKVReq(ctx, addr, req, timeout)
+}
+
+func (s *testCommitterSuite) TestCommitPrimaryError(c *C) {
+	timeouts := map[kvrpcpb.MessageType]bool{
+		kvrpcpb.MessageType_CmdCommit: true,
+	}
+	s.store.client = &timeoutKVClient{
+		Client:     s.store.client,
+		kvTimeouts: timeouts,
+	}
+
+	t, err := s.store.Begin()
+	c.Assert(err, IsNil)
+	txn := t.(*tikvTxn)
+	err = txn.Set([]byte("a"), []byte("b"))
+	c.Assert(err, IsNil)
+
+	err = txn.Commit()
+	c.Assert(err, NotNil)
+
+	c.Assert(terror.ErrorEqual(err, terror.ErrResultUndetermined), IsTrue)
 }

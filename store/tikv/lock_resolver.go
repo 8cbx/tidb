@@ -15,14 +15,12 @@ package tikv
 
 import (
 	"container/list"
-	"fmt"
 	"sync"
 
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
-	"github.com/pingcap/pd/pd-client"
-	"golang.org/x/net/context"
+	goctx "golang.org/x/net/context"
 )
 
 const resolvedCacheSize = 512
@@ -45,20 +43,6 @@ func newLockResolver(store *tikvStore) *LockResolver {
 	r.mu.resolved = make(map[uint64]TxnStatus)
 	r.mu.recentResolved = list.New()
 	return r
-}
-
-// NewLockResolver creates a LockResolver.
-func NewLockResolver(etcdAddrs []string) (*LockResolver, error) {
-	pdCli, err := pd.NewClient(etcdAddrs)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	uuid := fmt.Sprintf("tikv-%v", pdCli.GetClusterID())
-	s, err := newTikvStore(uuid, &codecPDClient{pdCli}, newRPCClient(), false)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return s.lockResolver, nil
 }
 
 // TxnStatus represents a txn's final status. It should be Commit or Rollback.
@@ -183,7 +167,7 @@ func (lr *LockResolver) ResolveLocks(bo *Backoffer, locks []*Lock) (ok bool, err
 // To avoid unnecessarily aborting too many txns, it is wiser to wait a few
 // seconds before calling it after Prewrite.
 func (lr *LockResolver) GetTxnStatus(txnID uint64, primary []byte) (TxnStatus, error) {
-	bo := NewBackoffer(cleanupMaxBackoff, context.Background())
+	bo := NewBackoffer(cleanupMaxBackoff, goctx.Background())
 	status, err := lr.getTxnStatus(bo, txnID, primary)
 	return status, errors.Trace(err)
 }

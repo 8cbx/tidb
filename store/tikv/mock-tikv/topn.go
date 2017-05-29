@@ -25,7 +25,7 @@ import (
 type sortRow struct {
 	key  []types.Datum
 	meta tipb.RowMeta
-	data []byte
+	data [][]byte
 }
 
 // topnSorter implements sort.Interface. When all rows have been processed, the topnSorter will sort the whole data in heap.
@@ -142,7 +142,7 @@ func (t *topnHeap) tryToAddRow(row *sortRow) bool {
 // evalTopN evaluates the top n elements from the data. The input receives a record including its handle and data.
 // And this function will check if this record can replace one of the old records.
 func (h *rpcHandler) evalTopN(ctx *selectContext, handle int64, values map[int64][]byte, columns []*tipb.ColumnInfo) error {
-	err := h.setColumnValueToCtx(ctx, handle, values, ctx.topnColumns)
+	err := setColumnValueToEval(ctx.eval, handle, values, ctx.topnColumns)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -159,7 +159,7 @@ func (h *rpcHandler) evalTopN(ctx *selectContext, handle int64, values map[int64
 	if ctx.topnHeap.tryToAddRow(newRow) {
 		for _, col := range columns {
 			val := values[col.GetColumnId()]
-			newRow.data = append(newRow.data, val...)
+			newRow.data = append(newRow.data, val)
 			newRow.meta.Length += int64(len(val))
 		}
 	}

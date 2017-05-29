@@ -14,8 +14,7 @@
 package kv
 
 import (
-	goctx "context"
-	"io"
+	goctx "golang.org/x/net/context"
 )
 
 // Transaction options
@@ -37,12 +36,12 @@ const (
 )
 
 // Those limits is enforced to make sure the transaction can be well handled by TiKV.
-const (
-	// The limit of single entry size (len(key) + len(value)).
+var (
+	// TxnEntrySizeLimit is limit of single entry size (len(key) + len(value)).
 	TxnEntrySizeLimit = 6 * 1024 * 1024
-	// The limit of number of entries in the MemBuffer.
-	TxnEntryCountLimit = 300 * 1000
-	// The limit of the sum of all entry size.
+	// TxnEntryCountLimit  is limit of number of entries in the MemBuffer.
+	TxnEntryCountLimit uint64 = 300 * 1000
+	// TxnTotalSizeLimit is limit of the sum of all entry size.
 	TxnTotalSizeLimit = 100 * 1024 * 1024
 )
 
@@ -117,14 +116,15 @@ type Client interface {
 	// Send sends request to KV layer, returns a Response.
 	Send(ctx goctx.Context, req *Request) Response
 
-	// SupportRequestType checks if reqType and subType is supported.
-	SupportRequestType(reqType, subType int64) bool
+	// IsRequestTypeSupported checks if reqType and subType is supported.
+	IsRequestTypeSupported(reqType, subType int64) bool
 }
 
 // ReqTypes.
 const (
 	ReqTypeSelect = 101
 	ReqTypeIndex  = 102
+	ReqTypeDAG    = 103
 
 	ReqSubTypeBasic   = 0
 	ReqSubTypeDesc    = 10000
@@ -134,16 +134,15 @@ const (
 
 // Request represents a kv request.
 type Request struct {
-	// The request type.
-	Tp   int64
-	Data []byte
-	// Key Ranges
+	// Tp is the request type.
+	Tp        int64
+	Data      []byte
 	KeyRanges []KeyRange
-	// If KeepOrder is true, the response should be returned in order.
+	// KeepOrder is true, if the response should be returned in order.
 	KeepOrder bool
-	// If desc is true, the request is sent in descending order.
+	// Desc is true, if the request is sent in descending order.
 	Desc bool
-	// If concurrency is 1, it only sends the request to a single storage unit when
+	// Concurrency is 1, if it only sends the request to a single storage unit when
 	// ResponseIterator.Next is called. If concurrency is greater than 1, the request will be
 	// sent to multiple storage units concurrently.
 	Concurrency int
@@ -154,7 +153,7 @@ type Response interface {
 	// Next returns a resultSubset from a single storage unit.
 	// When full result set is returned, nil is returned.
 	// TODO: Find a better interface for resultSubset that can avoid allocation and reuse bytes.
-	Next() (resultSubset io.ReadCloser, err error)
+	Next() (resultSubset []byte, err error)
 	// Close response.
 	Close() error
 }
@@ -187,7 +186,7 @@ type Storage interface {
 	GetClient() Client
 	// Close store
 	Close() error
-	// Storage's unique ID
+	// UUID return a unique ID which represents a Storage.
 	UUID() string
 	// CurrentVersion returns current max committed version.
 	CurrentVersion() (Version, error)

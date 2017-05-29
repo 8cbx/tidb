@@ -66,7 +66,7 @@ func NewGCWorker(store kv.Storage) (*GCWorker, error) {
 	return worker, nil
 }
 
-// Close stops backgroud goroutines.
+// Close stops background goroutines.
 func (w *GCWorker) Close() {
 	close(w.quit)
 }
@@ -117,7 +117,7 @@ func (w *GCWorker) start() {
 					break
 				}
 				// Disable privilege check for gc worker session.
-				privilege.BindPrivilegeChecker(w.session, nil)
+				privilege.BindPrivilegeManager(w.session, nil)
 			}
 
 			isLeader, err := w.checkLeader()

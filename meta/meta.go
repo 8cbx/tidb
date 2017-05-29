@@ -21,14 +21,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/plan/statistics"
 	"github.com/pingcap/tidb/structure"
 	"github.com/pingcap/tidb/terror"
 )
@@ -515,8 +512,6 @@ func (m *Meta) GetDDLJob(index int64) (*model.Job, error) {
 }
 
 func (m *Meta) updateDDLJob(index int64, job *model.Job, key []byte) error {
-	// TODO: use timestamp allocated by TSO
-	job.LastUpdateTS = time.Now().UnixNano()
 	b, err := job.Encode()
 	if err != nil {
 		return errors.Trace(err)
@@ -702,38 +697,6 @@ func (m *Meta) SetBgJobOwner(o *model.Owner) error {
 
 func (m *Meta) tableStatsKey(tableID int64) []byte {
 	return []byte(fmt.Sprintf("%s:%d", mTableStatsPrefix, tableID))
-}
-
-// SetTableStats sets table statistics.
-func (m *Meta) SetTableStats(tableID int64, tpb *statistics.TablePB) error {
-	key := m.tableStatsKey(tableID)
-	data, err := proto.Marshal(tpb)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	err = m.txn.Set(key, data)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	return nil
-}
-
-// GetTableStats gets table statistics.
-func (m *Meta) GetTableStats(tableID int64) (*statistics.TablePB, error) {
-	key := m.tableStatsKey(tableID)
-	data, err := m.txn.Get(key)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	if len(data) == 0 {
-		return nil, nil
-	}
-	tpb := &statistics.TablePB{}
-	err = proto.Unmarshal(data, tpb)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return tpb, nil
 }
 
 func (m *Meta) schemaDiffKey(schemaVersion int64) []byte {

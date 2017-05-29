@@ -97,11 +97,13 @@ func FindOnUpdateCols(cols []*Column) []*Column {
 
 // CastValues casts values based on columns type.
 func CastValues(ctx context.Context, rec []types.Datum, cols []*Column, ignoreErr bool) (err error) {
+	sc := ctx.GetSessionVars().StmtCtx
 	for _, c := range cols {
 		var converted types.Datum
 		converted, err = CastValue(ctx, rec[c.Offset], c.ToInfo())
 		if err != nil {
 			if ignoreErr {
+				sc.AppendWarning(err)
 				log.Warnf("cast values failed:%v", err)
 			} else {
 				return errors.Trace(err)
@@ -121,12 +123,20 @@ func CastValue(ctx context.Context, val types.Datum, col *model.ColumnInfo) (cas
 	if err != nil {
 		return casted, errors.Trace(err)
 	}
+	if ctx.GetSessionVars().SkipUTF8Check {
+		return casted, nil
+	}
 	if !mysql.IsUTF8Charset(col.Charset) {
 		return casted, nil
 	}
 	str := casted.GetString()
 	for i, r := range str {
 		if r == utf8.RuneError {
+			if strings.HasPrefix(str[i:], string(utf8.RuneError)) {
+				continue
+			}
+			log.Errorf("[%d] incorrect utf8 value: %x for column %s",
+				ctx.GetSessionVars().ConnectionID, []byte(str), col.Name)
 			// Truncate to valid utf8 string.
 			casted = types.NewStringDatum(str[:i])
 			err = sc.HandleTruncate(ErrTruncateWrongValue)

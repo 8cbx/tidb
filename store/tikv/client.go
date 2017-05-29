@@ -15,7 +15,6 @@
 package tikv
 
 import (
-	goctx "context"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +24,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/msgpb"
 	"github.com/pingcap/kvproto/pkg/util"
+	goctx "golang.org/x/net/context"
 )
 
 // Client is a client that sends RPC.
@@ -39,7 +39,7 @@ type Client interface {
 }
 
 const (
-	maxConnection     = 150
+	maxConnection     = 200
 	dialTimeout       = 5 * time.Second
 	writeTimeout      = 10 * time.Second
 	readTimeoutShort  = 20 * time.Second  // For requests that read/write several key-values.
@@ -76,6 +76,7 @@ func (c *rpcClient) SendCopReq(ctx goctx.Context, addr string, req *coprocessor.
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	connPoolHistogram.WithLabelValues("cop").Observe(time.Since(start).Seconds())
 	defer c.p.PutConn(conn)
 	msg := msgpb.Message{
 		MsgType: msgpb.MessageType_CopReq,
@@ -108,6 +109,7 @@ func (c *rpcClient) SendKVReq(ctx goctx.Context, addr string, req *kvrpcpb.Reque
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	connPoolHistogram.WithLabelValues("kv").Observe(time.Since(start).Seconds())
 	defer c.p.PutConn(conn)
 	msg := msgpb.Message{
 		MsgType: msgpb.MessageType_KvReq,

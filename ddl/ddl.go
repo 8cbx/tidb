@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/coreos/etcd/clientv3"
 	"github.com/juju/errors"
 	"github.com/ngaut/log"
 	"github.com/pingcap/tidb/ast"
@@ -34,6 +35,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/terror"
 	"github.com/twinj/uuid"
+	goctx "golang.org/x/net/context"
 )
 
 var (
@@ -51,9 +53,10 @@ var (
 	// We don't support dropping column with index covered now.
 	errCantDropColWithIndex    = terror.ClassDDL.New(codeCantDropColWithIndex, "can't drop column with index")
 	errUnsupportedAddColumn    = terror.ClassDDL.New(codeUnsupportedAddColumn, "unsupported add column")
-	errUnsupportedModifyColumn = terror.ClassDDL.New(codeUnsupportedModifyColumn, "unsupported modify column")
+	errUnsupportedModifyColumn = terror.ClassDDL.New(codeUnsupportedModifyColumn, "unsupported modify column %s")
 	errUnsupportedPKHandle     = terror.ClassDDL.New(codeUnsupportedDropPKHandle,
 		"unsupported drop integer primary key")
+	errUnsupportedCharset = terror.ClassDDL.New(codeUnsupportedCharset, "unsupported charset %s collate %s")
 
 	errBlobKeyWithoutLength = terror.ClassDDL.New(codeBlobKeyWithoutLength, "index for BLOB/TEXT column must specificate a key length")
 	errIncorrectPrefixKey   = terror.ClassDDL.New(codeIncorrectPrefixKey, "Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys")
@@ -81,6 +84,9 @@ var (
 	ErrInvalidIndexState = terror.ClassDDL.New(codeInvalidIndexState, "invalid index state")
 	// ErrInvalidForeignKeyState returns for invalid foreign key state.
 	ErrInvalidForeignKeyState = terror.ClassDDL.New(codeInvalidForeignKeyState, "invalid foreign key state")
+	// ErrUnsupportedModifyPrimaryKey returns an error when add or drop the primary key.
+	// It's exported for testing.
+	ErrUnsupportedModifyPrimaryKey = terror.ClassDDL.New(codeUnsupportedModifyPrimaryKey, "unsupported %s primary key")
 
 	// ErrColumnBadNull returns for a bad null value.
 	ErrColumnBadNull = terror.ClassDDL.New(codeBadNull, "column cann't be null")
@@ -111,7 +117,7 @@ type DDL interface {
 	RenameTable(ctx context.Context, oldTableIdent, newTableIdent ast.Ident) error
 	// SetLease will reset the lease time for online DDL change,
 	// it's a very dangerous function and you must guarantee that all servers have the same lease time.
-	SetLease(lease time.Duration)
+	SetLease(ctx goctx.Context, lease time.Duration)
 	// GetLease returns current schema lease time.
 	GetLease() time.Duration
 	// Stats returns the DDL statistics.
@@ -120,10 +126,36 @@ type DDL interface {
 	GetScope(status string) variable.ScopeFlag
 	// Stop stops DDL worker.
 	Stop() error
-	// Start starts DDL worker.
-	Start() error
+	// RegisterEventCh registers event channel for ddl.
+	RegisterEventCh(chan<- *Event)
+	// SchemaVersionSyncer gets the schema version syncer.
+	SchemaVersionSyncer() *schemaVersionSyncer
 }
 
+// Event is an event that a ddl operation happened.
+type Event struct {
+	Tp         model.ActionType
+	TableInfo  *model.TableInfo
+	ColumnInfo *model.ColumnInfo
+	IndexInfo  *model.IndexInfo
+}
+
+// String implements fmt.Stringer interface.
+func (e *Event) String() string {
+	ret := fmt.Sprintf("(Event Type: %s", e.Tp)
+	if e.TableInfo != nil {
+		ret += fmt.Sprintf(", Table ID: %d, Table Name %s", e.TableInfo.ID, e.TableInfo.Name)
+	}
+	if e.ColumnInfo != nil {
+		ret += fmt.Sprintf(", Column ID: %d, Column Name %s", e.ColumnInfo.ID, e.ColumnInfo.Name)
+	}
+	if e.IndexInfo != nil {
+		ret += fmt.Sprintf(", Index ID: %d, Index Name %s", e.IndexInfo.ID, e.IndexInfo.Name)
+	}
+	return ret
+}
+
+// ddl represents the statements which are used to define the database structure or schema.
 type ddl struct {
 	m sync.RWMutex
 
@@ -131,11 +163,14 @@ type ddl struct {
 	hook       Callback
 	hookMu     sync.RWMutex
 	store      kv.Storage
-	// Schema lease seconds.
+	// worker is used for electing the owner.
+	worker *worker
+	// lease is schema seconds.
 	lease        time.Duration
 	uuid         string
 	ddlJobCh     chan struct{}
 	ddlJobDoneCh chan struct{}
+	ddlEventCh   chan<- *Event
 	// Drop database/table job that runs in the background.
 	bgJobCh chan struct{}
 	// reorgDoneCh is for reorganization, if the reorganization job is done,
@@ -150,28 +185,71 @@ type ddl struct {
 	wait   sync.WaitGroup
 }
 
-// NewDDL creates a new DDL.
-func NewDDL(store kv.Storage, infoHandle *infoschema.Handle, hook Callback, lease time.Duration) DDL {
-	return newDDL(store, infoHandle, hook, lease)
+// RegisterEventCh registers passed channel for ddl Event.
+func (d *ddl) RegisterEventCh(ch chan<- *Event) {
+	d.ddlEventCh = ch
 }
 
-func newDDL(store kv.Storage, infoHandle *infoschema.Handle, hook Callback, lease time.Duration) *ddl {
+// asyncNotifyEvent will notify the ddl event to outside world, say statistic handle. When the channel is full, we may
+// give up notify and log it.
+func (d *ddl) asyncNotifyEvent(e *Event) {
+	if d.ddlEventCh != nil {
+		if d.lease == 0 {
+			// If lease is 0, it's always used in test.
+			select {
+			case d.ddlEventCh <- e:
+			default:
+			}
+			return
+		}
+		for i := 0; i < 10; i++ {
+			select {
+			case d.ddlEventCh <- e:
+				return
+			default:
+				log.Warnf("Fail to notify event %s.", e)
+				time.Sleep(time.Microsecond * 10)
+			}
+		}
+	}
+}
+
+// NewDDL creates a new DDL.
+func NewDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
+	infoHandle *infoschema.Handle, hook Callback, lease time.Duration) DDL {
+	return newDDL(ctx, etcdCli, store, infoHandle, hook, lease)
+}
+
+func newDDL(ctx goctx.Context, etcdCli *clientv3.Client, store kv.Storage,
+	infoHandle *infoschema.Handle, hook Callback, lease time.Duration) *ddl {
 	if hook == nil {
 		hook = &BaseCallback{}
+	}
+
+	id := uuid.NewV4().String()
+	ctx, cancelFunc := goctx.WithCancel(ctx)
+	worker := &worker{
+		schemaVersionSyncer: &schemaVersionSyncer{
+			etcdCli:           etcdCli,
+			selfSchemaVerPath: fmt.Sprintf("%s/%s", ddlAllSchemaVersions, id),
+		},
+		ddlID:  id,
+		cancel: cancelFunc,
 	}
 
 	d := &ddl{
 		infoHandle:   infoHandle,
 		hook:         hook,
 		store:        store,
+		uuid:         id,
 		lease:        lease,
-		uuid:         uuid.NewV4().String(),
 		ddlJobCh:     make(chan struct{}, 1),
 		ddlJobDoneCh: make(chan struct{}, 1),
 		bgJobCh:      make(chan struct{}, 1),
+		worker:       worker,
 	}
 
-	d.start()
+	d.start(ctx)
 
 	variable.RegisterStatistics(d)
 	log.Infof("start DDL:%s", d.uuid)
@@ -220,24 +298,16 @@ func (d *ddl) Stop() error {
 	return errors.Trace(err)
 }
 
-func (d *ddl) Start() error {
-	d.m.Lock()
-	defer d.m.Unlock()
-
-	if !d.isClosed() {
-		return nil
+func (d *ddl) start(ctx goctx.Context) {
+	d.quitCh = make(chan struct{})
+	if ChangeOwnerInNewWay {
+		d.campaignOwners(ctx)
 	}
 
-	d.start()
-
-	return nil
-}
-
-func (d *ddl) start() {
-	d.quitCh = make(chan struct{})
 	d.wait.Add(2)
 	go d.onBackgroundWorker()
 	go d.onDDLWorker()
+
 	// For every start, we will send a fake job to let worker
 	// check owner firstly and try to find whether a job exists and run.
 	asyncNotify(d.ddlJobCh)
@@ -250,6 +320,7 @@ func (d *ddl) close() {
 	}
 
 	close(d.quitCh)
+	d.worker.cancel()
 
 	d.wait.Wait()
 	log.Infof("close DDL:%s", d.uuid)
@@ -264,7 +335,7 @@ func (d *ddl) isClosed() bool {
 	}
 }
 
-func (d *ddl) SetLease(lease time.Duration) {
+func (d *ddl) SetLease(ctx goctx.Context, lease time.Duration) {
 	d.m.Lock()
 	defer d.m.Unlock()
 
@@ -283,7 +354,7 @@ func (d *ddl) SetLease(lease time.Duration) {
 	// Close the running worker and start again.
 	d.close()
 	d.lease = lease
-	d.start()
+	d.start(ctx)
 }
 
 func (d *ddl) GetLease() time.Duration {
@@ -306,6 +377,10 @@ func (d *ddl) genGlobalID() (int64, error) {
 	})
 
 	return globalID, errors.Trace(err)
+}
+
+func (d *ddl) SchemaVersionSyncer() *schemaVersionSyncer {
+	return d.worker.schemaVersionSyncer
 }
 
 func (d *ddl) doDDLJob(ctx context.Context, job *model.Job) error {
@@ -407,10 +482,12 @@ const (
 	codeInvalidIndexState      = 103
 	codeInvalidForeignKeyState = 104
 
-	codeCantDropColWithIndex    = 201
-	codeUnsupportedAddColumn    = 202
-	codeUnsupportedModifyColumn = 203
-	codeUnsupportedDropPKHandle = 204
+	codeCantDropColWithIndex        = 201
+	codeUnsupportedAddColumn        = 202
+	codeUnsupportedModifyColumn     = 203
+	codeUnsupportedDropPKHandle     = 204
+	codeUnsupportedCharset          = 205
+	codeUnsupportedModifyPrimaryKey = 206
 
 	codeFileNotFound          = 1017
 	codeErrorOnRename         = 1025
