@@ -22,13 +22,12 @@ import (
 )
 
 func (s *testStatsCacheSuite) TestDDLAfterLoad(c *C) {
-	store, do, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	testKit := testkit.NewTestKit(c, store)
+	defer cleanEnv(c, s.store, s.do)
+	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
 	testKit.MustExec("create table t (c1 int, c2 int)")
 	testKit.MustExec("analyze table t")
+	do := s.do
 	is := do.InfoSchema()
 	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
@@ -59,12 +58,11 @@ func (s *testStatsCacheSuite) TestDDLAfterLoad(c *C) {
 }
 
 func (s *testStatsCacheSuite) TestDDLTable(c *C) {
-	store, do, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	testKit := testkit.NewTestKit(c, store)
+	defer cleanEnv(c, s.store, s.do)
+	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
 	testKit.MustExec("create table t (c1 int, c2 int)")
+	do := s.do
 	is := do.InfoSchema()
 	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
@@ -84,7 +82,7 @@ func (s *testStatsCacheSuite) TestDDLTable(c *C) {
 	statsTbl = h.GetTableStats(tableInfo.ID)
 	c.Assert(statsTbl.Pseudo, IsTrue)
 
-	testKit.MustExec("create table t1 (c1 int, c2 int)")
+	testKit.MustExec("create table t1 (c1 int, c2 int, index idx(c1))")
 	is = do.InfoSchema()
 	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t1"))
 	c.Assert(err, IsNil)
@@ -105,19 +103,18 @@ func (s *testStatsCacheSuite) TestDDLTable(c *C) {
 }
 
 func (s *testStatsCacheSuite) TestDDLHistogram(c *C) {
-	store, do, err := newStoreWithBootstrap()
-	c.Assert(err, IsNil)
-	defer store.Close()
-	testKit := testkit.NewTestKit(c, store)
+	defer cleanEnv(c, s.store, s.do)
+	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
 	testKit.MustExec("create table t (c1 int, c2 int)")
 	testKit.MustExec("insert into t values(1,2),(3,4)")
 	testKit.MustExec("analyze table t")
+	do := s.do
 	h := do.StatsHandle()
 
-	testKit.MustExec("alter table t add column c3 int NOT NULL")
+	testKit.MustExec("alter table t add column c_null int")
 	<-h.DDLEventCh()
-	err = h.HandleDDLEvent(<-h.DDLEventCh())
+	err := h.HandleDDLEvent(<-h.DDLEventCh())
 	c.Assert(err, IsNil)
 	is := do.InfoSchema()
 	h.Update(is)
@@ -127,10 +124,24 @@ func (s *testStatsCacheSuite) TestDDLHistogram(c *C) {
 	statsTbl := do.StatsHandle().GetTableStats(tableInfo.ID)
 	c.Assert(statsTbl.Pseudo, IsFalse)
 	sc := new(variable.StatementContext)
-	count, err := statsTbl.ColumnEqualRowCount(sc, types.NewIntDatum(0), tableInfo.Columns[2])
+	c.Assert(statsTbl.ColumnIsInvalid(tableInfo.Columns[2]), IsTrue)
+	c.Check(statsTbl.Columns[tableInfo.Columns[2].ID].NDV, Equals, int64(0))
+
+	testKit.MustExec("alter table t add column c3 int NOT NULL")
+	err = h.HandleDDLEvent(<-h.DDLEventCh())
+	c.Assert(err, IsNil)
+	is = do.InfoSchema()
+	h.Update(is)
+	tbl, err = is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	c.Assert(err, IsNil)
+	tableInfo = tbl.Meta()
+	statsTbl = do.StatsHandle().GetTableStats(tableInfo.ID)
+	c.Assert(statsTbl.Pseudo, IsFalse)
+	sc = new(variable.StatementContext)
+	count, err := statsTbl.ColumnEqualRowCount(sc, types.NewIntDatum(0), tableInfo.Columns[3])
 	c.Assert(err, IsNil)
 	c.Assert(count, Equals, float64(2))
-	count, err = statsTbl.ColumnEqualRowCount(sc, types.NewIntDatum(1), tableInfo.Columns[2])
+	count, err = statsTbl.ColumnEqualRowCount(sc, types.NewIntDatum(1), tableInfo.Columns[3])
 	c.Assert(err, IsNil)
 	c.Assert(count, Equals, float64(0))
 
@@ -146,9 +157,9 @@ func (s *testStatsCacheSuite) TestDDLHistogram(c *C) {
 	// If we don't use original default value, we will get a pseudo table.
 	c.Assert(statsTbl.Pseudo, IsFalse)
 
-	rs := testKit.MustQuery("select count(*) from mysql.stats_histograms where table_id = ? and hist_id = 3 and is_index = 0", tableInfo.ID)
+	rs := testKit.MustQuery("select count(*) from mysql.stats_histograms where table_id = ? and hist_id = 4 and is_index = 0", tableInfo.ID)
 	rs.Check(testkit.Rows("1"))
-	rs = testKit.MustQuery("select count(*) from mysql.stats_buckets where table_id = ? and hist_id = 3 and is_index = 0", tableInfo.ID)
+	rs = testKit.MustQuery("select count(*) from mysql.stats_buckets where table_id = ? and hist_id = 4 and is_index = 0", tableInfo.ID)
 	rs.Check(testkit.Rows("1"))
 	testKit.MustExec("alter table t drop column c3")
 	err = h.HandleDDLEvent(<-h.DDLEventCh())
@@ -160,9 +171,9 @@ func (s *testStatsCacheSuite) TestDDLHistogram(c *C) {
 	tableInfo = tbl.Meta()
 	statsTbl = do.StatsHandle().GetTableStats(tableInfo.ID)
 	c.Assert(statsTbl.Pseudo, IsFalse)
-	rs = testKit.MustQuery("select count(*) from mysql.stats_histograms where table_id = ? and hist_id = 3 and is_index = 0", tableInfo.ID)
+	rs = testKit.MustQuery("select count(*) from mysql.stats_histograms where table_id = ? and hist_id = 4 and is_index = 0", tableInfo.ID)
 	rs.Check(testkit.Rows("0"))
-	rs = testKit.MustQuery("select count(*) from mysql.stats_buckets where table_id = ? and hist_id = 3 and is_index = 0", tableInfo.ID)
+	rs = testKit.MustQuery("select count(*) from mysql.stats_buckets where table_id = ? and hist_id = 4 and is_index = 0", tableInfo.ID)
 	rs.Check(testkit.Rows("0"))
 
 	testKit.MustExec("create index i on t(c2, c1)")

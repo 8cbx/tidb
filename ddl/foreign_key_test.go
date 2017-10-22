@@ -111,7 +111,7 @@ func getForeignKey(t table.Table, name string) *model.FKInfo {
 
 func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	defer testleak.AfterTest(c)()
-	d := newDDL(goctx.Background(), nil, s.store, nil, nil, testLease)
+	d := testNewDDL(goctx.Background(), nil, s.store, nil, nil, testLease)
 	defer d.Stop()
 	s.d = d
 	s.dbInfo = testSchemaInfo(c, d, "test_foreign")
@@ -132,14 +132,15 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	var mu sync.Mutex
 	checkOK := false
 	var hookErr error
-	tc := &testDDLCallback{}
+	tc := &TestDDLCallback{}
 	tc.onJobUpdated = func(job *model.Job) {
-		if job.State != model.JobDone {
+		if job.State != model.JobStateDone {
 			return
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		t, err := testGetTableWithError(d, s.dbInfo.ID, tblInfo.ID)
+		var t table.Table
+		t, err = testGetTableWithError(d, s.dbInfo.ID, tblInfo.ID)
 		if err != nil {
 			hookErr = errors.Trace(err)
 			return
@@ -151,7 +152,7 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 		}
 		checkOK = true
 	}
-	d.setHook(tc)
+	d.SetHook(tc)
 
 	d.Stop()
 	d.start(goctx.Background())
@@ -173,12 +174,13 @@ func (s *testForeighKeySuite) TestForeignKey(c *C) {
 	checkOK = false
 	mu.Unlock()
 	tc.onJobUpdated = func(job *model.Job) {
-		if job.State != model.JobDone {
+		if job.State != model.JobStateDone {
 			return
 		}
 		mu.Lock()
 		defer mu.Unlock()
-		t, err := testGetTableWithError(d, s.dbInfo.ID, tblInfo.ID)
+		var t table.Table
+		t, err = testGetTableWithError(d, s.dbInfo.ID, tblInfo.ID)
 		if err != nil {
 			hookErr = errors.Trace(err)
 			return

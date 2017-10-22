@@ -52,7 +52,7 @@ type Context interface {
 	GetSessionManager() util.SessionManager
 
 	// RefreshTxnCtx commits old transaction without retry,
-	// and creates a new transation.
+	// and creates a new transaction.
 	// now just for load data and batch insert.
 	RefreshTxnCtx() error
 
@@ -63,6 +63,9 @@ type Context interface {
 	// InitTxnWithStartTS initializes a transaction with startTS.
 	// It should be called right before we builds an executor.
 	InitTxnWithStartTS(startTS uint64) error
+
+	// GetStore returns the store of session.
+	GetStore() kv.Storage
 }
 
 type basicCtxType int

@@ -15,7 +15,6 @@ package executor
 
 import (
 	"strings"
-	"time"
 
 	"github.com/juju/errors"
 	"github.com/pingcap/tidb/ast"
@@ -27,7 +26,6 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/sessionctx/varsutil"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util/types"
 )
 
@@ -46,33 +44,24 @@ func (e *DDLExec) Schema() *expression.Schema {
 }
 
 // Next implements Execution Next interface.
-func (e *DDLExec) Next() (*Row, error) {
+func (e *DDLExec) Next() (Row, error) {
 	if e.done {
 		return nil, nil
 	}
-	// For create/drop database, create/drop/truncate table
-	// DDL worker do not wait 2 lease, so we need to wait in executor to make sure
-	// all TiDB server has updated the schema.
-	var needWait bool
 	var err error
 	switch x := e.Statement.(type) {
 	case *ast.TruncateTableStmt:
 		err = e.executeTruncateTable(x)
-		needWait = true
 	case *ast.CreateDatabaseStmt:
 		err = e.executeCreateDatabase(x)
-		needWait = true
 	case *ast.CreateTableStmt:
 		err = e.executeCreateTable(x)
-		needWait = true
 	case *ast.CreateIndexStmt:
 		err = e.executeCreateIndex(x)
 	case *ast.DropDatabaseStmt:
 		err = e.executeDropDatabase(x)
-		needWait = true
 	case *ast.DropTableStmt:
 		err = e.executeDropTable(x)
-		needWait = true
 	case *ast.DropIndexStmt:
 		err = e.executeDropIndex(x)
 	case *ast.AlterTableStmt:
@@ -83,15 +72,8 @@ func (e *DDLExec) Next() (*Row, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	if e.ctx.GetSessionVars().SkipDDLWait {
-		needWait = false
-	}
 
 	dom := sessionctx.GetDomain(e.ctx)
-	if needWait {
-		time.Sleep(dom.DDL().GetLease() * 2)
-	}
-
 	// Update InfoSchema in TxnCtx, so it will pass schema check.
 	is := dom.InfoSchema()
 	txnCtx := e.ctx.GetSessionVars().TxnCtx
@@ -120,6 +102,10 @@ func (e *DDLExec) executeTruncateTable(s *ast.TruncateTableStmt) error {
 }
 
 func (e *DDLExec) executeRenameTable(s *ast.RenameTableStmt) error {
+	if len(s.TableToTables) != 1 {
+		// Now we only allow one schema changing at the same time.
+		return errors.Errorf("can't run multi schema change")
+	}
 	oldIdent := ast.Ident{Schema: s.OldTable.Schema, Name: s.OldTable.Name}
 	newIdent := ast.Ident{Schema: s.NewTable.Schema, Name: s.NewTable.Name}
 	err := sessionctx.GetDomain(e.ctx).DDL().RenameTable(e.ctx, oldIdent, newIdent)
@@ -141,7 +127,7 @@ func (e *DDLExec) executeCreateDatabase(s *ast.CreateDatabaseStmt) error {
 	}
 	err := sessionctx.GetDomain(e.ctx).DDL().CreateSchema(e.ctx, model.NewCIStr(s.Name), opt)
 	if err != nil {
-		if terror.ErrorEqual(err, infoschema.ErrDatabaseExists) && s.IfNotExists {
+		if infoschema.ErrDatabaseExists.Equal(err) && s.IfNotExists {
 			err = nil
 		}
 	}
@@ -157,7 +143,7 @@ func (e *DDLExec) executeCreateTable(s *ast.CreateTableStmt) error {
 		referIdent := ast.Ident{Schema: s.ReferTable.Schema, Name: s.ReferTable.Name}
 		err = sessionctx.GetDomain(e.ctx).DDL().CreateTableWithLike(e.ctx, ident, referIdent)
 	}
-	if terror.ErrorEqual(err, infoschema.ErrTableExists) {
+	if infoschema.ErrTableExists.Equal(err) {
 		if s.IfNotExists {
 			return nil
 		}
@@ -168,14 +154,14 @@ func (e *DDLExec) executeCreateTable(s *ast.CreateTableStmt) error {
 
 func (e *DDLExec) executeCreateIndex(s *ast.CreateIndexStmt) error {
 	ident := ast.Ident{Schema: s.Table.Schema, Name: s.Table.Name}
-	err := sessionctx.GetDomain(e.ctx).DDL().CreateIndex(e.ctx, ident, s.Unique, model.NewCIStr(s.IndexName), s.IndexColNames)
+	err := sessionctx.GetDomain(e.ctx).DDL().CreateIndex(e.ctx, ident, s.Unique, model.NewCIStr(s.IndexName), s.IndexColNames, s.IndexOption)
 	return errors.Trace(err)
 }
 
 func (e *DDLExec) executeDropDatabase(s *ast.DropDatabaseStmt) error {
 	dbName := model.NewCIStr(s.Name)
 	err := sessionctx.GetDomain(e.ctx).DDL().DropSchema(e.ctx, dbName)
-	if terror.ErrorEqual(err, infoschema.ErrDatabaseNotExists) {
+	if infoschema.ErrDatabaseNotExists.Equal(err) {
 		if s.IfExists {
 			err = nil
 		} else {

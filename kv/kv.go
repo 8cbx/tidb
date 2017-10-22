@@ -14,6 +14,7 @@
 package kv
 
 import (
+	"github.com/pingcap/tidb/store/tikv/oracle"
 	goctx "golang.org/x/net/context"
 )
 
@@ -27,12 +28,37 @@ const (
 	// PresumeKeyNotExistsError is the option key for error.
 	// When PresumeKeyNotExists is set and condition is not match, should throw the error.
 	PresumeKeyNotExistsError
-	// BinlogData is the binlog data to write.
-	BinlogData
+	// BinlogInfo contains the binlog data and client.
+	BinlogInfo
 	// Skip existing check when "prewrite".
 	SkipCheckForWrite
 	// SchemaLeaseChecker is used for schema lease check.
 	SchemaLeaseChecker
+	// IsolationLevel sets isolation level for current transaction. The default level is SI.
+	IsolationLevel
+	// Priority marks the priority of this transaction.
+	Priority
+	// NotFillCache makes this request do not touch the LRU cache of the underlying storage.
+	NotFillCache
+	// SyncLog decides whether the WAL(write-ahead log) of this request should be synchronized.
+	SyncLog
+)
+
+// Priority value for transaction priority.
+const (
+	PriorityNormal int = iota
+	PriorityLow
+	PriorityHigh
+)
+
+// IsoLevel is the transaction's isolation level.
+type IsoLevel int
+
+const (
+	// SI stands for 'snapshot isolation'.
+	SI IsoLevel = iota
+	// RC stands for 'read committed'.
+	RC
 )
 
 // Those limits is enforced to make sure the transaction can be well handled by TiKV.
@@ -122,20 +148,25 @@ type Client interface {
 
 // ReqTypes.
 const (
-	ReqTypeSelect = 101
-	ReqTypeIndex  = 102
-	ReqTypeDAG    = 103
+	ReqTypeSelect  = 101
+	ReqTypeIndex   = 102
+	ReqTypeDAG     = 103
+	ReqTypeAnalyze = 104
 
-	ReqSubTypeBasic   = 0
-	ReqSubTypeDesc    = 10000
-	ReqSubTypeGroupBy = 10001
-	ReqSubTypeTopN    = 10002
+	ReqSubTypeBasic      = 0
+	ReqSubTypeDesc       = 10000
+	ReqSubTypeGroupBy    = 10001
+	ReqSubTypeTopN       = 10002
+	ReqSubTypeSignature  = 10003
+	ReqSubTypeAnalyzeIdx = 10004
+	ReqSubTypeAnalyzeCol = 10005
 )
 
 // Request represents a kv request.
 type Request struct {
 	// Tp is the request type.
 	Tp        int64
+	StartTs   uint64
 	Data      []byte
 	KeyRanges []KeyRange
 	// KeepOrder is true, if the response should be returned in order.
@@ -146,6 +177,14 @@ type Request struct {
 	// ResponseIterator.Next is called. If concurrency is greater than 1, the request will be
 	// sent to multiple storage units concurrently.
 	Concurrency int
+	// IsolationLevel is the isolation level, default is SI.
+	IsolationLevel IsoLevel
+	// Priority is the priority of this KV request, its value may be PriorityNormal/PriorityLow/PriorityHigh.
+	Priority int
+	// NotFillCache makes this request do not touch the LRU cache of the underlying storage.
+	NotFillCache bool
+	// SyncLog decides whether the WAL(write-ahead log) of this request should be synchronized.
+	SyncLog bool
 }
 
 // Response represents the response returned from KV layer.
@@ -190,6 +229,10 @@ type Storage interface {
 	UUID() string
 	// CurrentVersion returns current max committed version.
 	CurrentVersion() (Version, error)
+	// GetOracle gets a timestamp oracle client.
+	GetOracle() oracle.Oracle
+	// SupportDeleteRange gets the storage support delete range or not.
+	SupportDeleteRange() (supported bool)
 }
 
 // FnKeyCmp is the function for iterator the keys

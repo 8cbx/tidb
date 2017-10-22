@@ -14,6 +14,7 @@
 package tikv
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -56,7 +57,7 @@ func (s *testRegionCacheSuite) checkCache(c *C, len int) {
 	c.Assert(s.cache.mu.regions, HasLen, len)
 	c.Assert(s.cache.mu.sorted.Len(), Equals, len)
 	for _, r := range s.cache.mu.regions {
-		c.Assert(r, DeepEquals, s.cache.getRegionFromCache(r.StartKey()))
+		c.Assert(r.region, DeepEquals, s.cache.getRegionFromCache(r.region.StartKey()))
 	}
 }
 
@@ -83,6 +84,9 @@ func (s *testRegionCacheSuite) TestSimple(c *C) {
 	c.Assert(r.GetID(), Equals, s.region1)
 	c.Assert(s.getAddr(c, []byte("a")), Equals, s.storeAddr(s.store1))
 	s.checkCache(c, 1)
+	s.cache.mu.regions[r.VerID()].lastAccess = 0
+	r = s.cache.getRegionFromCache([]byte("a"))
+	c.Assert(r, IsNil)
 }
 
 func (s *testRegionCacheSuite) TestDropStore(c *C) {
@@ -243,12 +247,12 @@ func (s *testRegionCacheSuite) TestRequestFail(c *C) {
 	c.Assert(region.unreachableStores, HasLen, 0)
 
 	ctx, _ := s.cache.GetRPCContext(s.bo, region.VerID())
-	s.cache.OnRequestFail(ctx)
+	s.cache.OnRequestFail(ctx, errors.New("test error"))
 	region = s.getRegion(c, []byte("a"))
 	c.Assert(region.unreachableStores, DeepEquals, []uint64{s.store1})
 
 	ctx, _ = s.cache.GetRPCContext(s.bo, region.VerID())
-	s.cache.OnRequestFail(ctx)
+	s.cache.OnRequestFail(ctx, errors.New("test error"))
 	region = s.getRegion(c, []byte("a"))
 	// Out of range of Peers, so get Region again and pick Stores[0] as leader.
 	c.Assert(region.unreachableStores, HasLen, 0)
@@ -272,7 +276,7 @@ func (s *testRegionCacheSuite) TestRequestFail2(c *C) {
 	ctx, _ := s.cache.GetRPCContext(s.bo, loc1.Region)
 	c.Assert(s.cache.storeMu.stores, HasLen, 1)
 	s.checkCache(c, 2)
-	s.cache.OnRequestFail(ctx)
+	s.cache.OnRequestFail(ctx, errors.New("test error"))
 	// Both region2 and store should be dropped from cache.
 	c.Assert(s.cache.storeMu.stores, HasLen, 0)
 	c.Assert(s.cache.getRegionFromCache([]byte("x")), IsNil)

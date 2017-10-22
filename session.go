@@ -18,6 +18,7 @@
 package tidb
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -26,8 +27,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/juju/errors"
-	"github.com/ngaut/log"
 	"github.com/ngaut/pools"
 	"github.com/pingcap/tidb/ast"
 	"github.com/pingcap/tidb/context"
@@ -37,7 +38,7 @@ import (
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/parser"
-	"github.com/pingcap/tidb/perfschema"
+	"github.com/pingcap/tidb/plan/cache"
 	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/sessionctx"
@@ -46,8 +47,11 @@ import (
 	"github.com/pingcap/tidb/sessionctx/varsutil"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/store/localstore"
+	"github.com/pingcap/tidb/store/tikv/oracle"
 	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/auth"
+	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/types"
 	"github.com/pingcap/tipb/go-binlog"
 	goctx "golang.org/x/net/context"
@@ -57,25 +61,29 @@ import (
 type Session interface {
 	context.Context
 	Status() uint16                              // Flag of current status, such as autocommit.
-	LastInsertID() uint64                        // Last inserted auto_increment id.
+	LastInsertID() uint64                        // LastInsertID is the last inserted auto_increment ID.
 	AffectedRows() uint64                        // Affected rows by latest executed stmt.
 	Execute(sql string) ([]ast.RecordSet, error) // Execute a sql statement.
-	String() string                              // For debug
+	String() string                              // String is used to debug.
 	CommitTxn() error
 	RollbackTxn() error
-	// For execute prepare statement in binary protocol.
+	// PrepareStmt executes prepare statement in binary protocol.
 	PrepareStmt(sql string) (stmtID uint32, paramCount int, fields []*ast.ResultField, err error)
-	// Execute a prepared statement.
+	// ExecutePreparedStmt executes a prepared statement.
 	ExecutePreparedStmt(stmtID uint32, param ...interface{}) (ast.RecordSet, error)
 	DropPreparedStmt(stmtID uint32) error
 	SetClientCapability(uint32) // Set client capability flags.
 	SetConnectionID(uint64)
+	SetTLSState(*tls.ConnectionState)
+	SetCollation(coID int) error
 	SetSessionManager(util.SessionManager)
 	Close()
-	Auth(user string, auth []byte, salt []byte) bool
+	Auth(user *auth.UserIdentity, auth []byte, salt []byte) bool
 	// Cancel the execution of current transaction.
 	Cancel()
 	ShowProcess() util.ProcessInfo
+	// PrePareTxnCtx is exported for test.
+	PrepareTxnCtx()
 }
 
 var (
@@ -90,11 +98,13 @@ type stmtRecord struct {
 	params  []interface{}
 }
 
-type stmtHistory struct {
+// StmtHistory holds all histories of statements in a txn.
+type StmtHistory struct {
 	history []*stmtRecord
 }
 
-func (h *stmtHistory) add(stmtID uint32, st ast.Statement, stmtCtx *variable.StatementContext, params ...interface{}) {
+// Add appends a stmt to history list.
+func (h *StmtHistory) Add(stmtID uint32, st ast.Statement, stmtCtx *variable.StatementContext, params ...interface{}) {
 	s := &stmtRecord{
 		stmtID:  stmtID,
 		st:      st,
@@ -105,12 +115,11 @@ func (h *stmtHistory) add(stmtID uint32, st ast.Statement, stmtCtx *variable.Sta
 }
 
 type session struct {
-	// It's used by ShowProcess(), and should be modified atomically.
+	// processInfo is used by ShowProcess(), and should be modified atomically.
 	processInfo atomic.Value
 	txn         kv.Transaction // current transaction
 	txnFuture   *txnFuture
-	txnFutureCh chan *txnFuture
-	// For cancel the execution of current transaction.
+	// goCtx is used for cancelling the execution of current transaction.
 	goCtx      goctx.Context
 	cancelFunc goctx.CancelFunc
 
@@ -121,12 +130,7 @@ type session struct {
 
 	store kv.Storage
 
-	// Used for test only.
-	unlimitedRetryCount bool
-
-	// For performance_schema only.
-	stmtState *perfschema.StatementState
-	parser    *parser.Parser
+	parser *parser.Parser
 
 	sessionVars    *variable.SessionVars
 	sessionManager util.SessionManager
@@ -179,6 +183,29 @@ func (s *session) SetConnectionID(connectionID uint64) {
 	s.sessionVars.ConnectionID = connectionID
 }
 
+func (s *session) SetTLSState(tlsState *tls.ConnectionState) {
+	// If user is not connected via TLS, then tlsState == nil.
+	if tlsState != nil {
+		s.sessionVars.TLSConnectionState = tlsState
+	}
+}
+
+func (s *session) GetTLSState() *tls.ConnectionState {
+	return s.sessionVars.TLSConnectionState
+}
+
+func (s *session) SetCollation(coID int) error {
+	cs, co, err := charset.GetCharsetInfoByID(coID)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	for _, v := range variable.SetNamesVariables {
+		s.sessionVars.Systems[v] = cs
+	}
+	s.sessionVars.Systems[variable.CollationConnection] = co
+	return nil
+}
+
 func (s *session) SetSessionManager(sm util.SessionManager) {
 	s.sessionManager = sm
 }
@@ -189,40 +216,35 @@ func (s *session) GetSessionManager() util.SessionManager {
 
 type schemaLeaseChecker struct {
 	domain.SchemaValidator
-	schemaVer int64
+	schemaVer       int64
+	relatedTableIDs []int64
 }
 
-const (
-	schemaOutOfDateRetryInterval = 500 * time.Millisecond
-	schemaOutOfDateRetryTimes    = 10
+var (
+	// SchemaOutOfDateRetryInterval is the sleeping time when we fail to try.
+	SchemaOutOfDateRetryInterval = int64(500 * time.Millisecond)
+	// SchemaOutOfDateRetryTimes is upper bound of retry times when the schema is out of date.
+	SchemaOutOfDateRetryTimes = int32(10)
 )
 
 func (s *schemaLeaseChecker) Check(txnTS uint64) error {
+	schemaOutOfDateRetryInterval := atomic.LoadInt64(&SchemaOutOfDateRetryInterval)
+	schemaOutOfDateRetryTimes := int(atomic.LoadInt32(&SchemaOutOfDateRetryTimes))
 	for i := 0; i < schemaOutOfDateRetryTimes; i++ {
-		err := s.checkOnce(txnTS)
-		switch err {
-		case nil:
+		result := s.SchemaValidator.Check(txnTS, s.schemaVer, s.relatedTableIDs)
+		switch result {
+		case domain.ResultSucc:
 			return nil
-		case domain.ErrInfoSchemaChanged:
+		case domain.ResultFail:
 			schemaLeaseErrorCounter.WithLabelValues("changed").Inc()
-			return errors.Trace(err)
-		default:
+			return domain.ErrInfoSchemaChanged
+		case domain.ResultUnknown:
 			schemaLeaseErrorCounter.WithLabelValues("outdated").Inc()
-			time.Sleep(schemaOutOfDateRetryInterval)
+			time.Sleep(time.Duration(schemaOutOfDateRetryInterval))
 		}
+
 	}
 	return domain.ErrInfoSchemaExpired
-}
-
-func (s *schemaLeaseChecker) checkOnce(txnTS uint64) error {
-	succ := s.SchemaValidator.Check(txnTS, s.schemaVer)
-	if !succ {
-		if s.SchemaValidator.Latest() > s.schemaVer {
-			return domain.ErrInfoSchemaChanged
-		}
-		return domain.ErrInfoSchemaExpired
-	}
-	return nil
 }
 
 func (s *session) doCommit() error {
@@ -233,25 +255,35 @@ func (s *session) doCommit() error {
 		s.txn = nil
 		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
 	}()
-	if binloginfo.PumpClient != nil {
+	if s.sessionVars.BinlogClient != nil {
 		prewriteValue := binloginfo.GetPrewriteValue(s, false)
 		if prewriteValue != nil {
 			prewriteData, err := prewriteValue.Marshal()
 			if err != nil {
 				return errors.Trace(err)
 			}
-			bin := &binlog.Binlog{
-				Tp:            binlog.BinlogType_Prewrite,
-				PrewriteValue: prewriteData,
+			info := &binloginfo.BinlogInfo{
+				Data: &binlog.Binlog{
+					Tp:            binlog.BinlogType_Prewrite,
+					PrewriteValue: prewriteData,
+				},
+				Client: s.sessionVars.BinlogClient.(binlog.PumpClient),
 			}
-			s.txn.SetOption(kv.BinlogData, bin)
+			s.txn.SetOption(kv.BinlogInfo, info)
 		}
 	}
 
+	// Get the related table IDs.
+	relatedTables := s.GetSessionVars().TxnCtx.TableDeltaMap
+	tableIDs := make([]int64, 0, len(relatedTables))
+	for id := range relatedTables {
+		tableIDs = append(tableIDs, id)
+	}
 	// Set this option for 2 phase commit to validate schema lease.
 	s.txn.SetOption(kv.SchemaLeaseChecker, &schemaLeaseChecker{
 		SchemaValidator: sessionctx.GetDomain(s).SchemaValidator,
 		schemaVer:       s.sessionVars.TxnCtx.SchemaVersion,
+		relatedTableIDs: tableIDs,
 	})
 	if err := s.txn.Commit(); err != nil {
 		return errors.Trace(err)
@@ -272,7 +304,7 @@ func (s *session) doCommitWithRetry() error {
 			// We make larger transactions retry less times to prevent cluster resource outage.
 			txnSizeRate := float64(txnSize) / float64(kv.TxnTotalSizeLimit)
 			maxRetryCount := commitRetryLimit - int(float64(commitRetryLimit-1)*txnSizeRate)
-			err = s.retry(maxRetryCount, terror.ErrorEqual(err, domain.ErrInfoSchemaChanged))
+			err = s.retry(maxRetryCount, domain.ErrInfoSchemaChanged.Equal(err))
 		}
 	}
 	s.cleanRetryInfo()
@@ -290,7 +322,13 @@ func (s *session) doCommitWithRetry() error {
 }
 
 func (s *session) CommitTxn() error {
-	return s.doCommitWithRetry()
+	err := s.doCommitWithRetry()
+	label := "OK"
+	if err != nil {
+		label = "Error"
+	}
+	transactionCounter.WithLabelValues(label).Inc()
+	return errors.Trace(err)
 }
 
 func (s *session) RollbackTxn() error {
@@ -316,7 +354,7 @@ func (s *session) String() string {
 		"id":         sessVars.ConnectionID,
 		"user":       sessVars.User,
 		"currDBName": sessVars.CurrentDB,
-		"stauts":     sessVars.Status,
+		"status":     sessVars.Status,
 		"strictMode": sessVars.StrictSQLMode,
 	}
 	if s.txn != nil {
@@ -332,14 +370,21 @@ func (s *session) String() string {
 	if len(sessVars.PreparedStmts) > 0 {
 		data["preparedStmtCount"] = len(sessVars.PreparedStmts)
 	}
-	b, _ := json.MarshalIndent(data, "", "  ")
+	b, err := json.MarshalIndent(data, "", "  ")
+	terror.Log(errors.Trace(err))
 	return string(b)
 }
 
 const sqlLogMaxLen = 1024
 
+// SchemaChangedWithoutRetry is used for testing.
+var SchemaChangedWithoutRetry bool
+
 func (s *session) isRetryableError(err error) bool {
-	return kv.IsRetryableError(err) || terror.ErrorEqual(err, domain.ErrInfoSchemaChanged)
+	if SchemaChangedWithoutRetry {
+		return kv.IsRetryableError(err)
+	}
+	return kv.IsRetryableError(err) || domain.ErrInfoSchemaChanged.Equal(err)
 }
 
 func (s *session) retry(maxCnt int, infoSchemaChanged bool) error {
@@ -355,10 +400,10 @@ func (s *session) retry(maxCnt int, infoSchemaChanged bool) error {
 		s.txn = nil
 		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
 	}()
-	nh := getHistory(s)
+	nh := GetHistory(s)
 	var err error
 	for {
-		s.prepareTxnCtx()
+		s.PrepareTxnCtx()
 		s.sessionVars.RetryInfo.ResetOffset()
 		for i, sr := range nh.history {
 			st := sr.st
@@ -395,13 +440,15 @@ func (s *session) retry(maxCnt int, infoSchemaChanged bool) error {
 			return errors.Trace(err)
 		}
 		retryCnt++
-		infoSchemaChanged = terror.ErrorEqual(err, domain.ErrInfoSchemaChanged)
-		if !s.unlimitedRetryCount && (retryCnt >= maxCnt) {
+		infoSchemaChanged = domain.ErrInfoSchemaChanged.Equal(err)
+		if retryCnt >= maxCnt {
 			log.Warnf("[%d] Retry reached max count %d", connID, retryCnt)
 			return errors.Trace(err)
 		}
 		log.Warnf("[%d] retryable error: %v, txn: %v", connID, err, s.txn)
 		kv.BackOff(retryCnt)
+		s.txn = nil
+		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
 	}
 	return err
 }
@@ -487,7 +534,26 @@ func createSessionFunc(store kv.Storage) pools.Factory {
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		varsutil.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
+		err = varsutil.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		se.sessionVars.CommonGlobalLoaded = true
+		se.sessionVars.InRestrictedSQL = true
+		return se, nil
+	}
+}
+
+func createSessionWithDomainFunc(store kv.Storage) func(*domain.Domain) (pools.Resource, error) {
+	return func(dom *domain.Domain) (pools.Resource, error) {
+		se, err := createSessionWithDomain(store, dom)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		err = varsutil.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
 		se.sessionVars.CommonGlobalLoaded = true
 		se.sessionVars.InRestrictedSQL = true
 		return se, nil
@@ -551,6 +617,12 @@ func (s *session) GetGlobalSysVar(name string) (string, error) {
 
 // SetGlobalSysVar implements GlobalVarAccessor.SetGlobalSysVar interface.
 func (s *session) SetGlobalSysVar(name string, value string) error {
+	if name == variable.SQLModeVar {
+		value = mysql.FormatSQLModeStr(value)
+		if _, err := mysql.GetSQLMode(value); err != nil {
+			return errors.Trace(err)
+		}
+	}
 	sql := fmt.Sprintf(`REPLACE %s.%s VALUES ('%s', '%s');`,
 		mysql.SystemDB, mysql.GlobalVariablesTable, strings.ToLower(name), value)
 	_, _, err := s.ExecRestrictedSQL(s, sql)
@@ -571,68 +643,112 @@ func (s *session) SetProcessInfo(sql string) {
 		State:   s.Status(),
 		Info:    sql,
 	}
-	strs := strings.Split(s.sessionVars.User, "@")
-	if len(strs) == 2 {
-		pi.User = strs[0]
-		pi.Host = strs[1]
+	if s.sessionVars.User != nil {
+		pi.User = s.sessionVars.User.Username
+		pi.Host = s.sessionVars.User.Hostname
 	}
 	s.processInfo.Store(pi)
 }
 
-func (s *session) Execute(sql string) ([]ast.RecordSet, error) {
-	s.prepareTxnCtx()
-	startTS := time.Now()
+func (s *session) executeStatement(connID uint64, stmtNode ast.StmtNode, stmt ast.Statement, recordSets []ast.RecordSet) ([]ast.RecordSet, error) {
+	s.SetValue(context.QueryString, stmt.OriginText())
 
-	charset, collation := s.sessionVars.GetCharsetInfo()
-	connID := s.sessionVars.ConnectionID
-	rawStmts, err := s.ParseSQL(sql, charset, collation)
+	startTS := time.Now()
+	recordSet, err := runStmt(s, stmt)
 	if err != nil {
-		log.Warnf("[%d] parse error:\n%v\n%s", connID, err, sql)
+		if !kv.ErrKeyExists.Equal(err) {
+			log.Warnf("[%d] session error:\n%v\n%s", connID, errors.ErrorStack(err), s)
+		}
 		return nil, errors.Trace(err)
 	}
-	sessionExecuteParseDuration.Observe(time.Since(startTS).Seconds())
+	sessionExecuteRunDuration.Observe(time.Since(startTS).Seconds())
 
-	var rs []ast.RecordSet
-	ph := sessionctx.GetDomain(s).PerfSchema()
-	for i, rst := range rawStmts {
-		s.prepareTxnCtx()
-		startTS := time.Now()
-		// Some execution is done in compile stage, so we reset it before compile.
-		resetStmtCtx(s, rst)
-		st, err1 := Compile(s, rst)
-		if err1 != nil {
-			log.Warnf("[%d] compile error:\n%v\n%s", connID, err1, sql)
-			s.RollbackTxn()
-			return nil, errors.Trace(err1)
-		}
-		sessionExecuteCompileDuration.Observe(time.Since(startTS).Seconds())
-
-		s.stmtState = ph.StartStatement(sql, connID, perfschema.CallerNameSessionExecute, rawStmts[i])
-		s.SetValue(context.QueryString, st.OriginText())
-
-		startTS = time.Now()
-		r, err := runStmt(s, st)
-		ph.EndStatement(s.stmtState)
-		if err != nil {
-			if !terror.ErrorEqual(err, kv.ErrKeyExists) {
-				log.Warnf("[%d] session error:\n%v\n%s", connID, errors.ErrorStack(err), s)
-			}
-			return nil, errors.Trace(err)
-		}
-		sessionExecuteRunDuration.Observe(time.Since(startTS).Seconds())
-		if r != nil {
-			rs = append(rs, r)
-		}
+	if recordSet != nil {
+		recordSets = append(recordSets, recordSet)
 	}
-
-	if s.sessionVars.ClientCapability&mysql.ClientMultiResults == 0 && len(rs) > 1 {
-		// return the first recordset if client doesn't support ClientMultiResults.
-		rs = rs[:1]
-	}
-	return rs, nil
+	logCrucialStmt(stmtNode, s.sessionVars.User)
+	return recordSets, nil
 }
 
-// For execute prepare statement in binary protocol
+func (s *session) Execute(sql string) (recordSets []ast.RecordSet, err error) {
+	s.PrepareTxnCtx()
+	var (
+		cacheKey      cache.Key
+		cacheValue    cache.Value
+		useCachedPlan = false
+		connID        = s.sessionVars.ConnectionID
+	)
+
+	if cache.PlanCacheEnabled {
+		schemaVersion := sessionctx.GetDomain(s).InfoSchema().SchemaMetaVersion()
+		readOnly := s.Txn() == nil || s.Txn().IsReadOnly()
+
+		cacheKey = cache.NewSQLCacheKey(s.sessionVars, sql, schemaVersion, readOnly)
+		cacheValue, useCachedPlan = cache.GlobalPlanCache.Get(cacheKey)
+	}
+
+	if useCachedPlan {
+		stmtNode := cacheValue.(*cache.SQLCacheValue).StmtNode
+		stmt := &executor.ExecStmt{
+			InfoSchema: executor.GetInfoSchema(s),
+			Plan:       cacheValue.(*cache.SQLCacheValue).Plan,
+			Expensive:  cacheValue.(*cache.SQLCacheValue).Expensive,
+			Text:       stmtNode.Text(),
+		}
+
+		s.PrepareTxnCtx()
+		executor.ResetStmtCtx(s, stmtNode)
+		if recordSets, err = s.executeStatement(connID, stmtNode, stmt, recordSets); err != nil {
+			return nil, errors.Trace(err)
+		}
+	} else {
+		charset, collation := s.sessionVars.GetCharsetInfo()
+
+		// Step1: Compile query string to abstract syntax trees(ASTs).
+		startTS := time.Now()
+		stmtNodes, err := s.ParseSQL(sql, charset, collation)
+		if err != nil {
+			log.Warnf("[%d] parse error:\n%v\n%s", connID, err, sql)
+			return nil, errors.Trace(err)
+		}
+		sessionExecuteParseDuration.Observe(time.Since(startTS).Seconds())
+
+		compiler := executor.Compiler{}
+		for _, stmtNode := range stmtNodes {
+			s.PrepareTxnCtx()
+
+			// Step2: Transform abstract syntax tree to a physical plan(stored in executor.ExecStmt).
+			startTS = time.Now()
+			// Some executions are done in compile stage, so we reset them before compile.
+			executor.ResetStmtCtx(s, stmtNode)
+			stmt, err := compiler.Compile(s, stmtNode)
+			if err != nil {
+				log.Warnf("[%d] compile error:\n%v\n%s", connID, err, sql)
+				terror.Log(errors.Trace(s.RollbackTxn()))
+				return nil, errors.Trace(err)
+			}
+			sessionExecuteCompileDuration.Observe(time.Since(startTS).Seconds())
+
+			// Step3: Cache the physical plan if possible.
+			if cache.PlanCacheEnabled && stmt.Cacheable && len(stmtNodes) == 1 {
+				cache.GlobalPlanCache.Put(cacheKey, cache.NewSQLCacheValue(stmtNode, stmt.Plan, stmt.Expensive))
+			}
+
+			// Step4: Execute the physical plan.
+			if recordSets, err = s.executeStatement(connID, stmtNode, stmt, recordSets); err != nil {
+				return nil, errors.Trace(err)
+			}
+		}
+	}
+
+	if s.sessionVars.ClientCapability&mysql.ClientMultiResults == 0 && len(recordSets) > 1 {
+		// return the first recordset if client doesn't support ClientMultiResults.
+		recordSets = recordSets[:1]
+	}
+	return recordSets, nil
+}
+
+// PrepareStmt is used for executing prepare statement in binary protocol
 func (s *session) PrepareStmt(sql string) (stmtID uint32, paramCount int, fields []*ast.ResultField, err error) {
 	if s.sessionVars.TxnCtx.InfoSchema == nil {
 		// We don't need to create a transaction for prepare statement, just get information schema will do.
@@ -699,7 +815,7 @@ func (s *session) ExecutePreparedStmt(stmtID uint32, args ...interface{}) (ast.R
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	s.prepareTxnCtx()
+	s.PrepareTxnCtx()
 	st := executor.CompileExecutePreparedStmt(s, stmtID, args...)
 
 	r, err := runStmt(s, st)
@@ -715,47 +831,13 @@ func (s *session) DropPreparedStmt(stmtID uint32) error {
 	return nil
 }
 
-// If forceNew is true, GetTxn() must return a new transaction.
-// In this situation, if current transaction is still in progress,
-// there will be an implicit commit and create a new transaction.
-func (s *session) GetTxn(forceNew bool) (kv.Transaction, error) {
-	if s.txn != nil && !forceNew {
-		return s.txn, nil
-	}
-
-	var err error
-	var force string
-	if s.txn == nil {
-		err = s.loadCommonGlobalVariablesIfNeeded()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-	} else if forceNew {
-		err = s.CommitTxn()
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		force = "force"
-	}
-	s.txn, err = s.store.Begin()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	ac := s.sessionVars.IsAutocommit()
-	if !ac {
-		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, true)
-	}
-	log.Infof("[%d] %s new txn:%s", s.sessionVars.ConnectionID, force, s.txn)
-	return s.txn, nil
-}
-
 func (s *session) Txn() kv.Transaction {
 	return s.txn
 }
 
 func (s *session) NewTxn() error {
 	if s.txn != nil && s.txn.Valid() {
-		err := s.doCommitWithRetry()
+		err := s.CommitTxn()
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -765,6 +847,7 @@ func (s *session) NewTxn() error {
 		return errors.Trace(err)
 	}
 	s.txn = txn
+	s.sessionVars.TxnCtx.StartTS = txn.StartTS()
 	return nil
 }
 
@@ -789,9 +872,6 @@ func (s *session) ClearValue(key fmt.Stringer) {
 
 // Close function does some clean work when session end.
 func (s *session) Close() {
-	if s.txnFutureCh != nil {
-		close(s.txnFutureCh)
-	}
 	if s.statsCollector != nil {
 		s.statsCollector.Delete()
 	}
@@ -821,32 +901,27 @@ func (s *session) getPassword(name, host string) (string, error) {
 	return pwd, errors.Trace(err)
 }
 
-func (s *session) Auth(user string, auth []byte, salt []byte) bool {
-	strs := strings.Split(user, "@")
-	if len(strs) != 2 {
-		log.Warnf("Invalid format for user: %s", user)
-		return false
-	}
-	// Get user password.
-	name := strs[0]
-	host := strs[1]
+func (s *session) Auth(user *auth.UserIdentity, authentication []byte, salt []byte) bool {
 	pm := privilege.GetPrivilegeManager(s)
 
 	// Check IP.
-	if pm.ConnectionVerification(name, host, auth, salt) {
-		s.sessionVars.User = name + "@" + host
+	if pm.ConnectionVerification(user.Username, user.Hostname, authentication, salt) {
+		s.sessionVars.User = user
 		return true
 	}
 
 	// Check Hostname.
-	for _, addr := range getHostByIP(host) {
-		if pm.ConnectionVerification(name, addr, auth, salt) {
-			s.sessionVars.User = name + "@" + addr
+	for _, addr := range getHostByIP(user.Hostname) {
+		if pm.ConnectionVerification(user.Username, addr, authentication, salt) {
+			s.sessionVars.User = &auth.UserIdentity{
+				Username: user.Username,
+				Hostname: addr,
+			}
 			return true
 		}
 	}
 
-	log.Errorf("User connection verification failed %v", user)
+	log.Errorf("User connection verification failed %s", user)
 	return false
 }
 
@@ -854,7 +929,8 @@ func getHostByIP(ip string) []string {
 	if ip == "127.0.0.1" {
 		return []string{"localhost"}
 	}
-	addrs, _ := net.LookupAddr(ip)
+	addrs, err := net.LookupAddr(ip)
+	terror.Log(errors.Trace(err))
 	return addrs
 }
 
@@ -918,6 +994,17 @@ func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
 		return nil, errors.Trace(err)
 	}
 	err = dom.UpdateTableStatsLoop(se1)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	if raw, ok := store.(domain.EtcdBackend); ok {
+		err = raw.StartGCWorker()
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+	}
+
 	return dom, errors.Trace(err)
 }
 
@@ -942,8 +1029,8 @@ func runInBootstrapSession(store kv.Storage, bootstrap func(Session)) {
 	finishBootstrap(store)
 	s.ClearValue(context.Initing)
 
-	domain := sessionctx.GetDomain(s)
-	domain.Close()
+	dom := sessionctx.GetDomain(s)
+	dom.Close()
 	domap.Delete(store)
 }
 
@@ -961,13 +1048,30 @@ func createSession(store kv.Storage) (*session, error) {
 	sessionctx.BindDomain(s, domain)
 	// session implements variable.GlobalVarAccessor. Bind it to ctx.
 	s.sessionVars.GlobalVarsAccessor = s
+	s.sessionVars.BinlogClient = binloginfo.GetPumpClient()
+	return s, nil
+}
 
+// createSessionWithDomain creates a new Session and binds it with a Domain.
+// We need this because when we start DDL in Domain, the DDL need a session
+// to change some system tables. But at that time, we have been already in
+// a lock context, which cause we can't call createSesion directly.
+func createSessionWithDomain(store kv.Storage, dom *domain.Domain) (*session, error) {
+	s := &session{
+		store:       store,
+		parser:      parser.New(),
+		sessionVars: variable.NewSessionVars(),
+	}
+	s.mu.values = make(map[fmt.Stringer]interface{})
+	sessionctx.BindDomain(s, dom)
+	// session implements variable.GlobalVarAccessor. Bind it to ctx.
+	s.sessionVars.GlobalVarsAccessor = s
 	return s, nil
 }
 
 const (
 	notBootstrapped         = 0
-	currentBootstrapVersion = 11
+	currentBootstrapVersion = 15
 )
 
 func getStoreBootstrapVersion(store kv.Storage) int64 {
@@ -1012,20 +1116,20 @@ func finishBootstrap(store kv.Storage) {
 }
 
 const quoteCommaQuote = "', '"
-const loadCommonGlobalVarsSQL = "select * from mysql.global_variables where variable_name in ('" +
+const loadCommonGlobalVarsSQL = "select HIGH_PRIORITY * from mysql.global_variables where variable_name in ('" +
 	variable.AutocommitVar + quoteCommaQuote +
 	variable.SQLModeVar + quoteCommaQuote +
 	variable.MaxAllowedPacket + quoteCommaQuote +
 	/* TiDB specific global variables: */
 	variable.TiDBSkipUTF8Check + quoteCommaQuote +
-	variable.TiDBSkipDDLWait + quoteCommaQuote +
+	variable.TiDBIndexJoinBatchSize + quoteCommaQuote +
 	variable.TiDBIndexLookupSize + quoteCommaQuote +
 	variable.TiDBIndexLookupConcurrency + quoteCommaQuote +
 	variable.TiDBIndexSerialScanConcurrency + quoteCommaQuote +
 	variable.TiDBMaxRowCountForINLJ + quoteCommaQuote +
 	variable.TiDBDistSQLScanConcurrency + "')"
 
-// LoadCommonGlobalVariableIfNeeded loads and applies commonly used global variables for the session.
+// loadCommonGlobalVariablesIfNeeded loads and applies commonly used global variables for the session.
 func (s *session) loadCommonGlobalVariablesIfNeeded() error {
 	vars := s.sessionVars
 	if vars.CommonGlobalLoaded {
@@ -1046,7 +1150,10 @@ func (s *session) loadCommonGlobalVariablesIfNeeded() error {
 	for _, row := range rows {
 		varName := row.Data[0].GetString()
 		if _, ok := vars.Systems[varName]; !ok {
-			varsutil.SetSessionSystemVar(s.sessionVars, varName, row.Data[1])
+			err = varsutil.SetSessionSystemVar(s.sessionVars, varName, row.Data[1])
+			if err != nil {
+				return errors.Trace(err)
+			}
 		}
 	}
 	vars.CommonGlobalLoaded = true
@@ -1055,35 +1162,29 @@ func (s *session) loadCommonGlobalVariablesIfNeeded() error {
 
 // txnFuture is a promise, which promises to return a txn in future.
 type txnFuture struct {
-	sync.WaitGroup
-	txn kv.Transaction
-	err error
+	future oracle.Future
+	store  kv.Storage
+}
+
+func (tf *txnFuture) wait() (kv.Transaction, error) {
+	startTS, err := tf.future.Wait()
+	if err == nil {
+		return tf.store.BeginWithStartTS(startTS)
+	}
+
+	// It would retry get timestamp.
+	return tf.store.Begin()
 }
 
 func (s *session) getTxnFuture() *txnFuture {
-	if s.txnFutureCh == nil {
-		s.txnFutureCh = make(chan *txnFuture, 1)
-		go asyncGetTSWorker(s.store, s.txnFutureCh)
-	}
-
-	future := &txnFuture{}
-	future.Add(1)
-	s.txnFutureCh <- future
-	return future
+	oracle := s.store.GetOracle()
+	tsFuture := oracle.GetTimestampAsync(s.goCtx)
+	return &txnFuture{tsFuture, s.store}
 }
 
-func asyncGetTSWorker(store kv.Storage, ch chan *txnFuture) {
-	for future := range ch {
-		txn, err := store.Begin()
-		future.txn = txn
-		future.err = err
-		future.Done()
-	}
-}
-
-// prepareTxnCtx starts a goroutine to begin a transaction if needed, and creates a new transaction context.
+// PrepareTxnCtx starts a goroutine to begin a transaction if needed, and creates a new transaction context.
 // It is called before we execute a sql query.
-func (s *session) prepareTxnCtx() {
+func (s *session) PrepareTxnCtx() {
 	if s.txn != nil && s.txn.Valid() {
 		return
 	}
@@ -1091,9 +1192,8 @@ func (s *session) prepareTxnCtx() {
 		return
 	}
 
-	txnFuture := s.getTxnFuture()
-	goCtx, cancelFunc := goctx.WithCancel(goctx.Background())
-	s.txnFuture, s.goCtx, s.cancelFunc = txnFuture, goCtx, cancelFunc
+	s.goCtx, s.cancelFunc = goctx.WithCancel(goctx.Background())
+	s.txnFuture = s.getTxnFuture()
 	is := sessionctx.GetDomain(s).InfoSchema()
 	s.sessionVars.TxnCtx = &variable.TransactionContext{
 		InfoSchema:    is,
@@ -1123,14 +1223,18 @@ func (s *session) ActivePendingTxn() error {
 	}
 	future := s.txnFuture
 	s.txnFuture = nil
-	future.Wait()
-	if future.err != nil {
-		return errors.Trace(future.err)
-	}
-	s.txn = future.txn
-	err := s.loadCommonGlobalVariablesIfNeeded()
+	txn, err := future.wait()
 	if err != nil {
 		return errors.Trace(err)
+	}
+	s.txn = txn
+	s.sessionVars.TxnCtx.StartTS = s.txn.StartTS()
+	err = s.loadCommonGlobalVariablesIfNeeded()
+	if err != nil {
+		return errors.Trace(err)
+	}
+	if s.sessionVars.Systems[variable.TxnIsolation] == ast.ReadCommitted {
+		txn.SetOption(kv.IsolationLevel, kv.RC)
 	}
 	return nil
 }
@@ -1157,6 +1261,11 @@ func (s *session) InitTxnWithStartTS(startTS uint64) error {
 	return nil
 }
 
+// GetStore gets the store of session.
+func (s *session) GetStore() kv.Storage {
+	return s.store
+}
+
 func (s *session) ShowProcess() util.ProcessInfo {
 	var pi util.ProcessInfo
 	tmp := s.processInfo.Load()
@@ -1164,4 +1273,18 @@ func (s *session) ShowProcess() util.ProcessInfo {
 		pi = tmp.(util.ProcessInfo)
 	}
 	return pi
+}
+
+// logCrucialStmt logs some crucial SQL including: CREATE USER/GRANT PRIVILEGE/CHANGE PASSWORD/DDL etc.
+func logCrucialStmt(node ast.StmtNode, user *auth.UserIdentity) {
+	switch stmt := node.(type) {
+	case *ast.CreateUserStmt, *ast.DropUserStmt, *ast.AlterUserStmt, *ast.SetPwdStmt, *ast.GrantStmt,
+		*ast.RevokeStmt, *ast.AlterTableStmt, *ast.CreateDatabaseStmt, *ast.CreateIndexStmt, *ast.CreateTableStmt,
+		*ast.DropDatabaseStmt, *ast.DropIndexStmt, *ast.DropTableStmt, *ast.RenameTableStmt, *ast.TruncateTableStmt:
+		if ss, ok := node.(ast.SensitiveStmtNode); ok {
+			log.Infof("[CRUCIAL OPERATION] %s (by %s).", ss.SecureText(), user)
+		} else {
+			log.Infof("[CRUCIAL OPERATION] %s (by %s).", stmt.Text(), user)
+		}
+	}
 }

@@ -29,7 +29,7 @@ type testStatSuite struct {
 }
 
 func (s *testStatSuite) getDDLSchemaVer(c *C, d *ddl) int64 {
-	m, err := d.Stats()
+	m, err := d.Stats(nil)
 	c.Assert(err, IsNil)
 	v := m[ddlSchemaVersion]
 	return v.(int64)
@@ -40,7 +40,7 @@ func (s *testStatSuite) TestStat(c *C) {
 	store := testCreateStore(c, "test_stat")
 	defer store.Close()
 
-	d := newDDL(goctx.Background(), nil, store, nil, nil, testLease)
+	d := testNewDDL(goctx.Background(), nil, store, nil, nil, testLease)
 	defer d.Stop()
 
 	time.Sleep(testLease)
@@ -48,9 +48,10 @@ func (s *testStatSuite) TestStat(c *C) {
 	dbInfo := testSchemaInfo(c, d, "test")
 	testCreateSchema(c, testNewContext(d), d, dbInfo)
 
-	m, err := d.Stats()
-	c.Assert(err, IsNil)
-	c.Assert(m[ddlOwnerID], Equals, d.uuid)
+	// TODO: Get this information from etcd.
+	//	m, err := d.Stats(nil)
+	//	c.Assert(err, IsNil)
+	//	c.Assert(m[ddlOwnerID], Equals, d.uuid)
 
 	job := &model.Job{
 		SchemaID:   dbInfo.ID,
@@ -79,9 +80,9 @@ LOOP:
 			d.start(goctx.Background())
 		case err := <-done:
 			c.Assert(err, IsNil)
-			m, err := d.Stats()
-			c.Assert(err, IsNil)
-			c.Assert(m[bgOwnerID], Equals, d.uuid)
+			// TODO: Get this information from etcd.
+			// m, err := d.Stats(nil)
+			// c.Assert(err, IsNil)
 			break LOOP
 		}
 	}

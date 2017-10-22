@@ -14,8 +14,7 @@
 package expression
 
 import (
-	"bytes"
-	"encoding/json"
+	goJSON "encoding/json"
 	"fmt"
 
 	"github.com/juju/errors"
@@ -25,22 +24,8 @@ import (
 	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/codec"
 	"github.com/pingcap/tidb/util/types"
-)
-
-// Error instances.
-var (
-	errInvalidOperation        = terror.ClassExpression.New(codeInvalidOperation, "invalid operation")
-	errIncorrectParameterCount = terror.ClassExpression.New(codeIncorrectParameterCount, "Incorrect parameter count in the call to native function '%s'")
-	errFunctionNotExists       = terror.ClassExpression.New(codeFunctionNotExists, "FUNCTION %s does not exist")
-)
-
-// Error codes.
-const (
-	codeInvalidOperation        terror.ErrCode = 1
-	codeIncorrectParameterCount                = 1582
-	codeFunctionNotExists                      = 1305
+	"github.com/pingcap/tidb/util/types/json"
 )
 
 // EvalAstExpr evaluates ast expression directly.
@@ -49,7 +34,7 @@ var EvalAstExpr func(expr ast.ExprNode, ctx context.Context) (types.Datum, error
 // Expression represents all scalar expression in SQL.
 type Expression interface {
 	fmt.Stringer
-	json.Marshaler
+	goJSON.Marshaler
 
 	// Eval evaluates an expression through a row.
 	Eval(row []types.Datum) (types.Datum, error)
@@ -72,11 +57,11 @@ type Expression interface {
 	// EvalDuration returns the duration representation of expression.
 	EvalDuration(row []types.Datum, sc *variable.StatementContext) (val types.Duration, isNull bool, err error)
 
+	// EvalJSON returns the JSON representation of expression.
+	EvalJSON(row []types.Datum, sc *variable.StatementContext) (val json.JSON, isNull bool, err error)
+
 	// GetType gets the type that the expression returns.
 	GetType() *types.FieldType
-
-	// GetTypeClass gets the TypeClass that the expression returns.
-	GetTypeClass() types.TypeClass
 
 	// Clone copies an expression totally.
 	Clone() Expression
@@ -95,6 +80,9 @@ type Expression interface {
 
 	// ResolveIndices resolves indices by the given schema.
 	ResolveIndices(schema *Schema)
+
+	// ExplainInfo returns operator information to be explained.
+	ExplainInfo() string
 }
 
 // CNFExprs stands for a CNF expression.
@@ -131,226 +119,6 @@ func EvalBool(exprList CNFExprs, row []types.Datum, ctx context.Context) (bool, 
 	return true, nil
 }
 
-// evalExprToInt evaluates `expr` to int type.
-func evalExprToInt(expr Expression, row []types.Datum, sc *variable.StatementContext) (res int64, isNull bool, err error) {
-	val, err := expr.Eval(row)
-	if val.IsNull() || err != nil {
-		return res, val.IsNull(), errors.Trace(err)
-	}
-	if expr.GetTypeClass() == types.ClassInt {
-		return val.GetInt64(), false, nil
-	} else if IsHybridType(expr) {
-		res, err = val.ToInt64(sc)
-		return res, false, errors.Trace(err)
-	}
-	panic(fmt.Sprintf("cannot get INT result from %s expression", types.TypeStr(expr.GetType().Tp)))
-}
-
-// evalExprToReal evaluates `expr` to real type.
-func evalExprToReal(expr Expression, row []types.Datum, sc *variable.StatementContext) (res float64, isNull bool, err error) {
-	val, err := expr.Eval(row)
-	if val.IsNull() || err != nil {
-		return res, val.IsNull(), errors.Trace(err)
-	}
-	if expr.GetTypeClass() == types.ClassReal {
-		return val.GetFloat64(), false, nil
-	} else if IsHybridType(expr) {
-		res, err = val.ToFloat64(sc)
-		return res, false, errors.Trace(err)
-	}
-	panic(fmt.Sprintf("cannot get REAL result from %s expression", types.TypeStr(expr.GetType().Tp)))
-}
-
-// evalExprToDecimal evaluates `expr` to decimal type.
-func evalExprToDecimal(expr Expression, row []types.Datum, sc *variable.StatementContext) (res *types.MyDecimal, isNull bool, err error) {
-	val, err := expr.Eval(row)
-	if val.IsNull() || err != nil {
-		return res, val.IsNull(), errors.Trace(err)
-	}
-	if expr.GetTypeClass() == types.ClassDecimal {
-		return val.GetMysqlDecimal(), false, nil
-	} else if IsHybridType(expr) {
-		res, err = val.ToDecimal(sc)
-		return res, false, errors.Trace(err)
-	}
-	panic(fmt.Sprintf("cannot get DECIMAL result from %s expression", types.TypeStr(expr.GetType().Tp)))
-}
-
-// evalExprToString evaluates `expr` to string type.
-func evalExprToString(expr Expression, row []types.Datum, _ *variable.StatementContext) (res string, isNull bool, err error) {
-	val, err := expr.Eval(row)
-	if val.IsNull() || err != nil {
-		return res, val.IsNull(), errors.Trace(err)
-	}
-	if expr.GetTypeClass() == types.ClassString {
-		// We cannot use val.GetString() directly.
-		// For example, `Bit` is regarded as ClassString,
-		// while we can not use val.GetString() to get the value of a Bit variable,
-		// because value of `Bit` is stored in Datum.i while val.GetString() get value from Datum.b.
-		res, err = val.ToString()
-		return res, false, errors.Trace(err)
-	}
-	panic(fmt.Sprintf("cannot get STRING result from %s expression", types.TypeStr(expr.GetType().Tp)))
-}
-
-// evalExprToTime evaluates `expr` to TIME type.
-func evalExprToTime(expr Expression, row []types.Datum, _ *variable.StatementContext) (res types.Time, isNull bool, err error) {
-	if IsHybridType(expr) {
-		return res, true, nil
-	}
-	val, err := expr.Eval(row)
-	if val.IsNull() || err != nil {
-		return res, val.IsNull(), errors.Trace(err)
-	}
-	switch expr.GetType().Tp {
-	case mysql.TypeDatetime, mysql.TypeDate, mysql.TypeTimestamp:
-		return val.GetMysqlTime(), false, nil
-	default:
-		panic(fmt.Sprintf("cannot get DATE result from %s expression", types.TypeStr(expr.GetType().Tp)))
-	}
-}
-
-// evalExprToDuration evaluates `expr` to DURATION type.
-func evalExprToDuration(expr Expression, row []types.Datum, _ *variable.StatementContext) (res types.Duration, isNull bool, err error) {
-	if IsHybridType(expr) {
-		return res, true, nil
-	}
-	val, err := expr.Eval(row)
-	if val.IsNull() || err != nil {
-		return res, val.IsNull(), errors.Trace(err)
-	}
-	if expr.GetType().Tp == mysql.TypeDuration {
-		return val.GetMysqlDuration(), false, nil
-	}
-	panic(fmt.Sprintf("cannot get DURATION result from %s expression", types.TypeStr(expr.GetType().Tp)))
-}
-
-// One stands for a number 1.
-var One = &Constant{
-	Value:   types.NewDatum(1),
-	RetType: types.NewFieldType(mysql.TypeTiny),
-}
-
-// Zero stands for a number 0.
-var Zero = &Constant{
-	Value:   types.NewDatum(0),
-	RetType: types.NewFieldType(mysql.TypeTiny),
-}
-
-// Null stands for null constant.
-var Null = &Constant{
-	Value:   types.NewDatum(nil),
-	RetType: types.NewFieldType(mysql.TypeTiny),
-}
-
-// Constant stands for a constant value.
-type Constant struct {
-	Value   types.Datum
-	RetType *types.FieldType
-}
-
-// String implements fmt.Stringer interface.
-func (c *Constant) String() string {
-	return fmt.Sprintf("%v", c.Value.GetValue())
-}
-
-// MarshalJSON implements json.Marshaler interface.
-func (c *Constant) MarshalJSON() ([]byte, error) {
-	buffer := bytes.NewBufferString(fmt.Sprintf("\"%s\"", c))
-	return buffer.Bytes(), nil
-}
-
-// Clone implements Expression interface.
-func (c *Constant) Clone() Expression {
-	con := *c
-	return &con
-}
-
-// GetType implements Expression interface.
-func (c *Constant) GetType() *types.FieldType {
-	return c.RetType
-}
-
-// GetTypeClass implements Expression interface.
-func (c *Constant) GetTypeClass() types.TypeClass {
-	return c.RetType.ToClass()
-}
-
-// Eval implements Expression interface.
-func (c *Constant) Eval(_ []types.Datum) (types.Datum, error) {
-	return c.Value, nil
-}
-
-// EvalInt returns int representation of Constant.
-func (c *Constant) EvalInt(_ []types.Datum, sc *variable.StatementContext) (int64, bool, error) {
-	val, isNull, err := evalExprToInt(c, nil, sc)
-	return val, isNull, errors.Trace(err)
-}
-
-// EvalReal returns real representation of Constant.
-func (c *Constant) EvalReal(_ []types.Datum, sc *variable.StatementContext) (float64, bool, error) {
-	val, isNull, err := evalExprToReal(c, nil, sc)
-	return val, isNull, errors.Trace(err)
-}
-
-// EvalString returns string representation of Constant.
-func (c *Constant) EvalString(_ []types.Datum, sc *variable.StatementContext) (string, bool, error) {
-	val, isNull, err := evalExprToString(c, nil, sc)
-	return val, isNull, errors.Trace(err)
-}
-
-// EvalDecimal returns decimal representation of Constant.
-func (c *Constant) EvalDecimal(_ []types.Datum, sc *variable.StatementContext) (*types.MyDecimal, bool, error) {
-	val, isNull, err := evalExprToDecimal(c, nil, sc)
-	return val, isNull, errors.Trace(err)
-}
-
-// EvalTime returns DATE/DATETIME/TIMESTAMP representation of Constant.
-func (c *Constant) EvalTime(_ []types.Datum, sc *variable.StatementContext) (types.Time, bool, error) {
-	val, isNull, err := evalExprToTime(c, nil, sc)
-	return val, isNull, errors.Trace(err)
-}
-
-// EvalDuration returns Duration representation of Constant.
-func (c *Constant) EvalDuration(_ []types.Datum, sc *variable.StatementContext) (types.Duration, bool, error) {
-	val, isNull, err := evalExprToDuration(c, nil, sc)
-	return val, isNull, errors.Trace(err)
-}
-
-// Equal implements Expression interface.
-func (c *Constant) Equal(b Expression, ctx context.Context) bool {
-	y, ok := b.(*Constant)
-	if !ok {
-		return false
-	}
-	con, err := c.Value.CompareDatum(ctx.GetSessionVars().StmtCtx, y.Value)
-	if err != nil || con != 0 {
-		return false
-	}
-	return true
-}
-
-// IsCorrelated implements Expression interface.
-func (c *Constant) IsCorrelated() bool {
-	return false
-}
-
-// Decorrelate implements Expression interface.
-func (c *Constant) Decorrelate(_ *Schema) Expression {
-	return c
-}
-
-// HashCode implements Expression interface.
-func (c *Constant) HashCode() []byte {
-	var bytes []byte
-	bytes, _ = codec.EncodeValue(bytes, c.Value)
-	return bytes
-}
-
-// ResolveIndices implements Expression interface.
-func (c *Constant) ResolveIndices(_ *Schema) {
-}
-
 // composeConditionWithBinaryOp composes condition with binary operator into a balance deep tree, which benefits a lot for pb decoder/encoder.
 func composeConditionWithBinaryOp(ctx context.Context, conditions []Expression, funcName string) Expression {
 	length := len(conditions)
@@ -360,7 +128,7 @@ func composeConditionWithBinaryOp(ctx context.Context, conditions []Expression, 
 	if length == 1 {
 		return conditions[0]
 	}
-	expr, _ := NewFunction(ctx, funcName,
+	expr := NewFunctionInternal(ctx, funcName,
 		types.NewFieldType(mysql.TypeTiny),
 		composeConditionWithBinaryOp(ctx, conditions[:length/2], funcName),
 		composeConditionWithBinaryOp(ctx, conditions[length/2:], funcName))
@@ -369,12 +137,12 @@ func composeConditionWithBinaryOp(ctx context.Context, conditions []Expression, 
 
 // ComposeCNFCondition composes CNF items into a balance deep CNF tree, which benefits a lot for pb decoder/encoder.
 func ComposeCNFCondition(ctx context.Context, conditions ...Expression) Expression {
-	return composeConditionWithBinaryOp(ctx, conditions, ast.AndAnd)
+	return composeConditionWithBinaryOp(ctx, conditions, ast.LogicAnd)
 }
 
 // ComposeDNFCondition composes DNF items into a balance deep DNF tree.
 func ComposeDNFCondition(ctx context.Context, conditions ...Expression) Expression {
-	return composeConditionWithBinaryOp(ctx, conditions, ast.OrOr)
+	return composeConditionWithBinaryOp(ctx, conditions, ast.LogicOr)
 }
 
 // Assignment represents a set assignment in Update, such as
@@ -412,13 +180,13 @@ func splitNormalFormItems(onExpr Expression, funcName string) []Expression {
 // SplitCNFItems splits CNF items.
 // CNF means conjunctive normal form, e.g. "a and b and c".
 func SplitCNFItems(onExpr Expression) []Expression {
-	return splitNormalFormItems(onExpr, ast.AndAnd)
+	return splitNormalFormItems(onExpr, ast.LogicAnd)
 }
 
 // SplitDNFItems splits DNF items.
 // DNF means disjunctive normal form, e.g. "a or b or c".
 func SplitDNFItems(onExpr Expression) []Expression {
-	return splitNormalFormItems(onExpr, ast.OrOr)
+	return splitNormalFormItems(onExpr, ast.LogicOr)
 }
 
 // EvaluateExprWithNull sets columns in schema as null and calculate the final result of the scalar function.
@@ -438,7 +206,7 @@ func EvaluateExprWithNull(ctx context.Context, schema *Schema, expr Expression) 
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
-		return FoldConstant(newFunc), nil
+		return newFunc, nil
 	case *Column:
 		if !schema.Contains(x) {
 			return x, nil
@@ -450,9 +218,14 @@ func EvaluateExprWithNull(ctx context.Context, schema *Schema, expr Expression) 
 	}
 }
 
-// TableInfo2Schema converts table info to schema.
+// TableInfo2Schema converts table info to schema with empty DBName.
 func TableInfo2Schema(tbl *model.TableInfo) *Schema {
-	cols := ColumnInfos2Columns(tbl.Name, tbl.Columns)
+	return TableInfo2SchemaWithDBName(model.CIStr{}, tbl)
+}
+
+// TableInfo2SchemaWithDBName converts table info to schema.
+func TableInfo2SchemaWithDBName(dbName model.CIStr, tbl *model.TableInfo) *Schema {
+	cols := ColumnInfos2ColumnsWithDBName(dbName, tbl.Name, tbl.Columns)
 	keys := make([]KeyInfo, 0, len(tbl.Indices)+1)
 	for _, idx := range tbl.Indices {
 		if !idx.Unique || idx.State != model.StatePublic {
@@ -494,46 +267,58 @@ func TableInfo2Schema(tbl *model.TableInfo) *Schema {
 	return schema
 }
 
-// ColumnInfos2Columns converts a slice of ColumnInfo to a slice of Column.
+// ColumnInfos2Columns converts a slice of ColumnInfo to a slice of Column with empty DBName.
 func ColumnInfos2Columns(tblName model.CIStr, colInfos []*model.ColumnInfo) []*Column {
+	return ColumnInfos2ColumnsWithDBName(model.CIStr{}, tblName, colInfos)
+}
+
+// ColumnInfos2ColumnsWithDBName converts a slice of ColumnInfo to a slice of Column.
+func ColumnInfos2ColumnsWithDBName(dbName, tblName model.CIStr, colInfos []*model.ColumnInfo) []*Column {
 	columns := make([]*Column, 0, len(colInfos))
 	for i, col := range colInfos {
 		newCol := &Column{
 			ColName:  col.Name,
 			TblName:  tblName,
+			DBName:   dbName,
 			RetType:  &col.FieldType,
 			Position: i,
+			Index:    col.Offset,
 		}
 		columns = append(columns, newCol)
 	}
 	return columns
 }
 
-// NewCastFunc creates a new cast function.
-func NewCastFunc(tp *types.FieldType, arg Expression, ctx context.Context) *ScalarFunction {
-	bt := &builtinCastSig{newBaseBuiltinFunc([]Expression{arg}, ctx), tp}
-	return &ScalarFunction{
-		FuncName: model.NewCIStr(ast.Cast),
-		RetType:  tp,
-		Function: bt.setSelf(bt),
-	}
-}
-
 // NewValuesFunc creates a new values function.
 func NewValuesFunc(offset int, retTp *types.FieldType, ctx context.Context) *ScalarFunction {
-	fc := &valuesFunctionClass{baseFunctionClass{ast.Values, 0, 0}, offset}
-	bt, _ := fc.getFunction(nil, ctx)
+	fc := &valuesFunctionClass{baseFunctionClass{ast.Values, 0, 0}, offset, retTp}
+	bt, err := fc.getFunction(ctx, nil)
+	terror.Log(errors.Trace(err))
 	return &ScalarFunction{
 		FuncName: model.NewCIStr(ast.Values),
 		RetType:  retTp,
-		Function: bt.setSelf(bt),
+		Function: bt,
 	}
 }
 
-func init() {
-	expressionMySQLErrCodes := map[terror.ErrCode]uint16{
-		codeIncorrectParameterCount: mysql.ErrWrongParamcountToNativeFct,
-		codeFunctionNotExists:       mysql.ErrSpDoesNotExist,
+// IsHybridType checks whether a ClassString expression is a hybrid type value which will return different types of value in different context.
+//
+// For ENUM/SET which is consist of a string attribute `Name` and an int attribute `Value`,
+// it will cause an error if we convert ENUM/SET to int as a string value.
+//
+// For BinaryLiteral/MysqlBit, we will get a wrong result if we convert it to int as a string value.
+// For example, when convert `0b101` to int, the result should be 5, but we will get 101 if we regard it as a string.
+func IsHybridType(expr Expression) bool {
+	if expr.GetType().Hybrid() {
+		return true
 	}
-	terror.ErrClassToMySQLCodes[terror.ClassExpression] = expressionMySQLErrCodes
+
+	// For a constant, the field type will be inferred as `VARCHAR` when the kind of it is BinaryLiteral
+	if con, ok := expr.(*Constant); ok {
+		switch con.Value.Kind() {
+		case types.KindBinaryLiteral:
+			return true
+		}
+	}
+	return false
 }
